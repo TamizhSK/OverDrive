@@ -1,0 +1,948 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >-
+  ServiceCare backend platform. HTTP API Gateway, the API Lambda, the DynamoDB/S3 data plane, the ticket event
+  pipeline (tickets stream -> Lambda -> EventBridge -> SNS advisor alerts and SQS -> Lambda for the diagnostics
+  workflow and customer emails), scheduled DynamoDB exports to S3, least-privilege execution roles and the GitHub
+  Actions deploy role. Serverless - no VPC, ALB or ECS.
+
+Parameters:
+  OriginVerifyToken:
+    Type: String
+    NoEcho: true
+    AllowedPattern: '^[A-Za-z0-9]{32,128}$'
+    Description: Shared secret CloudFront sends as X-Origin-Verify. Must equal the frontend stack's OriginVerifyToken.
+  WebOrigin:
+    Type: String
+    AllowedPattern: '^https://[^/]+$'
+    Description: HTTPS origin of the web app (frontend stack output WebUrl). Used for CORS on the API and the attachments bucket.
+  CognitoUserPoolId:
+    Type: String
+    AllowedPattern: '^[a-z]{2}-[a-z]+-[0-9]_[A-Za-z0-9]+$'
+  CognitoClientIds:
+    Type: CommaDelimitedList
+    Description: App client IDs whose access tokens are accepted (frontend stack output CognitoClientId).
+  LogRetentionDays:
+    Type: Number
+    Default: 14
+    AllowedValues: [1, 3, 5, 7, 14, 30, 60, 90, 180, 365]
+  KnowledgeBaseId:
+    Type: String
+    Default: ''
+    AllowedPattern: '^([A-Z0-9]{10})?$'
+    Description: Existing ServiceCare Knowledge Base ID. Empty disables grounded answers.
+  KnowledgeBaseRegion:
+    Type: String
+    Default: eu-north-1
+    AllowedPattern: '^[a-z]{2}-[a-z]+-[0-9]$'
+    Description: Region containing the Knowledge Base used by the AgentCore harness.
+  AgentCoreHarnessArn:
+    Type: String
+    Default: ''
+    AllowedPattern: '^(|arn:[a-z0-9-]+:bedrock-agentcore:[a-z0-9-]+:[0-9]{12}:harness/[A-Za-z][A-Za-z0-9_]{0,39}-[A-Za-z0-9]{10})$'
+    Description: Existing approved AgentCore harness ARN. Set only after cross-region data transfer is approved.
+  AgentCoreRuntimeArn:
+    Type: String
+    Default: ''
+    AllowedPattern: '^(|arn:[a-z0-9-]+:bedrock-agentcore:[a-z0-9-]+:[0-9]{12}:runtime/[A-Za-z0-9_-]+)$'
+    Description: Runtime associated with the configured harness; scopes invocation permissions without changing that runtime.
+  AgentCoreModelId:
+    Type: String
+    Default: amazon.nova-lite-v1:0
+    AllowedValues: [amazon.nova-lite-v1:0]
+    Description: Regional text model override for KB-grounded chat, avoiding global inference routing.
+  QuickSightDashboardId:
+    Type: String
+    Default: servicecare-advisor-analytics
+    AllowedPattern: '^([A-Za-z0-9_-]{1,128})?$'
+    Description: Dashboard ID created by the analytics stack. Empty disables embedded analytics.
+  QuickSightEmbedUserArn:
+    Type: String
+    Default: ''
+    Description: QuickSight reader user used for registered-user dashboard embedding. Empty falls back to anonymous embedding, which needs capacity pricing.
+  AdvisorNotificationEmail:
+    Type: String
+    Default: ''
+    AllowedPattern: '^([A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,})?$'
+    Description: Optional approved advisor email address. Recipient must confirm the SNS subscription.
+  KnowledgeModelArn:
+    Type: String
+    Default: ''
+    Description: Optional regional foundation-model ARN used for grounded answers.
+  TriageModelArn:
+    Type: String
+    Default: ''
+    Description: Optional regional foundation-model ARN used for AI triage. Empty keeps rule-based triage.
+  TriageWorkflowArn:
+    Type: String
+    Default: ''
+    Description: >-
+      ARN of the pre-existing diagnostics/triage Step Functions workflow (owned by another team, lives in
+      eu-north-1 regardless of where this stack is deployed). Every new ticket with a VIN starts one execution
+      named after the ticket ID, with {vin, ownerId, customerIssue}; empty disables the call.
+  CustomerDashboardUrl:
+    Type: String
+    AllowedPattern: '^https://[^ ]+$'
+    Description: Existing JWT-protected customer dashboard API used to verify vehicle ownership on ticket creation.
+  CustomerEmailSender:
+    Type: String
+    Default: ''
+    AllowedPattern: '^([A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,})?$'
+    Description: >-
+      Verified Amazon SES sender (address or address in a verified domain, in this stack's region) for customer ticket
+      updates. Empty disables customer emails; while the SES account is in the sandbox, recipients must be verified too.
+  BackupSchedule:
+    Type: String
+    Default: 'cron(0 2 * * ? *)'
+    Description: EventBridge Scheduler expression (UTC) for the full DynamoDB exports of the tickets and interactions tables to S3.
+  BackupRetentionDays:
+    Type: Number
+    Default: 35
+    MinValue: 1
+    Description: Days an export is kept in the backup bucket before it expires.
+  GitHubRepository:
+    Type: String
+    Default: your-org/overdrive
+    AllowedPattern: '^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$'
+  GitHubBranch:
+    Type: String
+    Default: main
+    AllowedPattern: '^[A-Za-z0-9._/-]+$'
+  PermissionsBoundaryArn:
+    Type: String
+    Default: ''
+    Description: Optional IAM permissions boundary applied to the roles created here.
+
+Conditions:
+  HasPermissionsBoundary: !Not [!Equals [!Ref PermissionsBoundaryArn, '']]
+  HasKnowledgeModel: !Not [!Equals [!Ref KnowledgeModelArn, '']]
+  HasTriageModel: !Not [!Equals [!Ref TriageModelArn, '']]
+  HasAnyModel: !Or [!Condition HasKnowledgeModel, !Condition HasTriageModel]
+  HasKnowledge: !And
+    - !Not [!Equals [!Ref KnowledgeBaseId, '']]
+    - !Condition HasKnowledgeModel
+  HasTriageWorkflow: !Not [!Equals [!Ref TriageWorkflowArn, '']]
+  HasAgentCoreHarness: !Not [!Equals [!Ref AgentCoreHarnessArn, '']]
+  HasAgentCoreRuntime: !Not [!Equals [!Ref AgentCoreRuntimeArn, '']]
+  HasQuickSightDashboard: !Not [!Equals [!Ref QuickSightDashboardId, '']]
+  HasAdvisorNotificationEmail: !Not [!Equals [!Ref AdvisorNotificationEmail, '']]
+  HasCustomerEmail: !Not [!Equals [!Ref CustomerEmailSender, '']]
+
+Resources:
+  # ---------------------------------------------------------------- data plane
+  TicketsTable:
+    Type: AWS::DynamoDB::Table
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Properties:
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - { AttributeName: ticketId, AttributeType: S }
+        - { AttributeName: customerId, AttributeType: S }
+        - { AttributeName: queueKey, AttributeType: S }
+        - { AttributeName: updatedAt, AttributeType: S }
+      KeySchema:
+        - { AttributeName: ticketId, KeyType: HASH }
+      GlobalSecondaryIndexes:
+        - IndexName: customer-updated
+          KeySchema:
+            - { AttributeName: customerId, KeyType: HASH }
+            - { AttributeName: updatedAt, KeyType: RANGE }
+          Projection: { ProjectionType: ALL }
+        - IndexName: queue-updated
+          KeySchema:
+            - { AttributeName: queueKey, KeyType: HASH }
+            - { AttributeName: updatedAt, KeyType: RANGE }
+          Projection: { ProjectionType: ALL }
+      PointInTimeRecoverySpecification:
+        PointInTimeRecoveryEnabled: true
+      SSESpecification:
+        SSEEnabled: true
+      StreamSpecification:
+        StreamViewType: NEW_AND_OLD_IMAGES
+
+  InteractionsTable:
+    Type: AWS::DynamoDB::Table
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Properties:
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - { AttributeName: interactionId, AttributeType: S }
+        - { AttributeName: customerId, AttributeType: S }
+        - { AttributeName: createdAt, AttributeType: S }
+      KeySchema:
+        - { AttributeName: interactionId, KeyType: HASH }
+      GlobalSecondaryIndexes:
+        - IndexName: customer-created
+          KeySchema:
+            - { AttributeName: customerId, KeyType: HASH }
+            - { AttributeName: createdAt, KeyType: RANGE }
+          Projection: { ProjectionType: ALL }
+      PointInTimeRecoverySpecification:
+        PointInTimeRecoveryEnabled: true
+      SSESpecification:
+        SSEEnabled: true
+      StreamSpecification:
+        StreamViewType: NEW_AND_OLD_IMAGES
+
+  AttachmentsBucket:
+    Type: AWS::S3::Bucket
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Properties:
+      OwnershipControls:
+        Rules:
+          - ObjectOwnership: BucketOwnerEnforced
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - BucketKeyEnabled: true
+            ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+      VersioningConfiguration:
+        Status: Enabled
+      LifecycleConfiguration:
+        Rules:
+          - Id: abort-incomplete-uploads
+            Status: Enabled
+            AbortIncompleteMultipartUpload:
+              DaysAfterInitiation: 1
+      CorsConfiguration:
+        CorsRules:
+          - AllowedOrigins: [!Ref WebOrigin]
+            AllowedMethods: [POST, GET, HEAD]
+            AllowedHeaders: ['*']
+            ExposedHeaders: [ETag]
+            MaxAge: 300
+
+  AttachmentsBucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket: !Ref AttachmentsBucket
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: DenyInsecureTransport
+            Effect: Deny
+            Principal: '*'
+            Action: 's3:*'
+            Resource:
+              - !GetAtt AttachmentsBucket.Arn
+              - !Sub '${AttachmentsBucket.Arn}/*'
+            Condition:
+              Bool:
+                'aws:SecureTransport': 'false'
+
+  NotificationsKey:
+    Type: AWS::KMS::Key
+    Properties:
+      Description: ServiceCare advisor notification encryption
+      EnableKeyRotation: true
+      PendingWindowInDays: 7
+      KeyPolicy:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: DelegateToAccountIam
+            Effect: Allow
+            Principal:
+              AWS: !Sub 'arn:${AWS::Partition}:iam::${AWS::AccountId}:root'
+            Action: 'kms:*'
+            Resource: '*'
+          - Sid: AllowEventBridgeToPublishAdvisorAlerts
+            Effect: Allow
+            Principal:
+              Service: events.amazonaws.com
+            Action: ['kms:GenerateDataKey*', 'kms:Decrypt']
+            Resource: '*'
+            Condition:
+              StringEquals:
+                'aws:SourceAccount': !Ref 'AWS::AccountId'
+
+  NotificationsTopic:
+    Type: AWS::SNS::Topic
+    Properties:
+      KmsMasterKeyId: !Ref NotificationsKey
+
+  AdvisorEmailSubscription:
+    Type: AWS::SNS::Subscription
+    Condition: HasAdvisorNotificationEmail
+    Properties:
+      TopicArn: !Ref NotificationsTopic
+      Protocol: email
+      Endpoint: !Ref AdvisorNotificationEmail
+
+  NotificationsTopicPolicy:
+    Type: AWS::SNS::TopicPolicy
+    Properties:
+      Topics: [!Ref NotificationsTopic]
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: AdvisorAlertRuleOnly
+            Effect: Allow
+            Principal: {Service: events.amazonaws.com}
+            Action: 'sns:Publish'
+            Resource: !Ref NotificationsTopic
+            Condition:
+              ArnEquals:
+                'aws:SourceArn': !GetAtt AdvisorAlertRule.Arn
+
+  # ---------------------------------------------------------------- ticket events
+  # Every ticket write (API, visual confirmation, agent tools) lands in the tickets table; its stream is the single
+  # source of ticket events, so no writer can forget to notify and a failed publish is retried from the stream.
+  TicketEventsDeadLetterQueue:
+    Type: AWS::SQS::Queue
+    Properties:
+      SqsManagedSseEnabled: true
+      MessageRetentionPeriod: 1209600
+
+  TicketEventsDeadLetterQueuePolicy:
+    Type: AWS::SQS::QueuePolicy
+    Properties:
+      Queues: [!Ref TicketEventsDeadLetterQueue]
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: UndeliverableRuleTargets
+            Effect: Allow
+            Principal: {Service: events.amazonaws.com}
+            Action: 'sqs:SendMessage'
+            Resource: !GetAtt TicketEventsDeadLetterQueue.Arn
+            Condition:
+              ArnEquals:
+                'aws:SourceArn': [!GetAtt AdvisorAlertRule.Arn, !GetAtt TicketActionsRule.Arn]
+
+  TicketEventsDeadLetterAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmDescription: A ticket event, advisor alert or ticket action could not be delivered. Inspect and redrive the dead-letter queue.
+      Namespace: AWS/SQS
+      MetricName: ApproximateNumberOfMessagesVisible
+      Dimensions:
+        - Name: QueueName
+          Value: !GetAtt TicketEventsDeadLetterQueue.QueueName
+      Statistic: Maximum
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: 0
+      ComparisonOperator: GreaterThanThreshold
+      TreatMissingData: notBreaching
+
+  TicketActionsQueue:
+    Type: AWS::SQS::Queue
+    Properties:
+      SqsManagedSseEnabled: true
+      VisibilityTimeout: 180
+      MessageRetentionPeriod: 345600
+      RedrivePolicy:
+        deadLetterTargetArn: !GetAtt TicketEventsDeadLetterQueue.Arn
+        maxReceiveCount: 5
+
+  TicketActionsQueuePolicy:
+    Type: AWS::SQS::QueuePolicy
+    Properties:
+      Queues: [!Ref TicketActionsQueue]
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: TicketActionsRuleOnly
+            Effect: Allow
+            Principal: {Service: events.amazonaws.com}
+            Action: 'sqs:SendMessage'
+            Resource: !GetAtt TicketActionsQueue.Arn
+            Condition:
+              ArnEquals:
+                'aws:SourceArn': !GetAtt TicketActionsRule.Arn
+
+  # Customer activity advisors must see: a new ticket or a customer reply. Messages carry IDs and priority only.
+  AdvisorAlertRule:
+    Type: AWS::Events::Rule
+    Properties:
+      Description: New tickets and customer replies alert advisors through SNS.
+      EventBusName: default
+      EventPattern:
+        source: [servicecare.ticket]
+        $or:
+          - detail-type: [TicketCreated]
+          - detail-type: [TicketMessageAdded]
+            detail:
+              authorRole: [customer]
+      Targets:
+        - Id: advisor-alerts
+          Arn: !Ref NotificationsTopic
+          DeadLetterConfig: {Arn: !GetAtt TicketEventsDeadLetterQueue.Arn}
+          RetryPolicy: {MaximumEventAgeInSeconds: 86400, MaximumRetryAttempts: 185}
+          InputTransformer:
+            InputPathsMap:
+              type: '$.detail-type'
+              ticket: '$.detail.ticketId'
+              priority: '$.detail.priority'
+              category: '$.detail.category'
+            InputTemplate: '"ServiceCare <type>: ticket <ticket>, priority <priority>, category <category>. Open the advisor workspace to respond."'
+
+  # Everything that needs code: the diagnostics workflow for new tickets and customer emails for advisor-side changes.
+  TicketActionsRule:
+    Type: AWS::Events::Rule
+    Properties:
+      Description: New tickets and advisor-side changes go to the ticket actions queue.
+      EventBusName: default
+      EventPattern:
+        source: [servicecare.ticket]
+        $or:
+          - detail-type: [TicketCreated, TicketAssigned, TicketStatusChanged, TicketResolved]
+          - detail-type: [TicketMessageAdded]
+            detail:
+              authorRole: [advisor]
+      Targets:
+        - Id: ticket-actions
+          Arn: !GetAtt TicketActionsQueue.Arn
+          DeadLetterConfig: {Arn: !GetAtt TicketEventsDeadLetterQueue.Arn}
+          RetryPolicy: {MaximumEventAgeInSeconds: 86400, MaximumRetryAttempts: 185}
+
+  # ---------------------------------------------------------------- scheduled DynamoDB exports
+  BackupBucket:
+    Type: AWS::S3::Bucket
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Properties:
+      OwnershipControls:
+        Rules:
+          - ObjectOwnership: BucketOwnerEnforced
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - BucketKeyEnabled: true
+            ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+      LifecycleConfiguration:
+        Rules:
+          - Id: expire-old-exports
+            Status: Enabled
+            ExpirationInDays: !Ref BackupRetentionDays
+            AbortIncompleteMultipartUpload:
+              DaysAfterInitiation: 1
+
+  BackupBucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket: !Ref BackupBucket
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: DenyInsecureTransport
+            Effect: Deny
+            Principal: '*'
+            Action: 's3:*'
+            Resource:
+              - !GetAtt BackupBucket.Arn
+              - !Sub '${BackupBucket.Arn}/*'
+            Condition:
+              Bool:
+                'aws:SecureTransport': 'false'
+
+  BackupSchedulerRole:
+    Type: AWS::IAM::Role
+    Properties:
+      Description: Lets EventBridge Scheduler start point-in-time exports of the ticket tables into the backup bucket.
+      PermissionsBoundary: !If [HasPermissionsBoundary, !Ref PermissionsBoundaryArn, !Ref 'AWS::NoValue']
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: scheduler.amazonaws.com
+            Action: sts:AssumeRole
+            Condition:
+              StringEquals:
+                'aws:SourceAccount': !Ref 'AWS::AccountId'
+      Policies:
+        - PolicyName: export-ticket-tables
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Sid: ExportTicketTables
+                Effect: Allow
+                Action: 'dynamodb:ExportTableToPointInTime'
+                Resource: [!GetAtt TicketsTable.Arn, !GetAtt InteractionsTable.Arn]
+              - Sid: WriteExports
+                Effect: Allow
+                Action: ['s3:PutObject', 's3:AbortMultipartUpload', 's3:PutObjectAcl']
+                Resource: !Sub '${BackupBucket.Arn}/*'
+
+  TicketsBackupSchedule:
+    Type: AWS::Scheduler::Schedule
+    Properties:
+      Description: Full point-in-time export of the tickets table to the backup bucket.
+      ScheduleExpression: !Ref BackupSchedule
+      ScheduleExpressionTimezone: UTC
+      FlexibleTimeWindow: {Mode: 'OFF'}
+      State: ENABLED
+      Target:
+        Arn: !Sub 'arn:${AWS::Partition}:scheduler:::aws-sdk:dynamodb:exportTableToPointInTime'
+        RoleArn: !GetAtt BackupSchedulerRole.Arn
+        Input: !Sub '{"TableArn":"${TicketsTable.Arn}","S3Bucket":"${BackupBucket}","S3BucketOwner":"${AWS::AccountId}","S3Prefix":"tickets","ExportFormat":"DYNAMODB_JSON","ExportType":"FULL_EXPORT"}'
+        RetryPolicy: {MaximumEventAgeInSeconds: 3600, MaximumRetryAttempts: 3}
+
+  InteractionsBackupSchedule:
+    Type: AWS::Scheduler::Schedule
+    Properties:
+      Description: Full point-in-time export of the interactions table to the backup bucket.
+      ScheduleExpression: !Ref BackupSchedule
+      ScheduleExpressionTimezone: UTC
+      FlexibleTimeWindow: {Mode: 'OFF'}
+      State: ENABLED
+      Target:
+        Arn: !Sub 'arn:${AWS::Partition}:scheduler:::aws-sdk:dynamodb:exportTableToPointInTime'
+        RoleArn: !GetAtt BackupSchedulerRole.Arn
+        Input: !Sub '{"TableArn":"${InteractionsTable.Arn}","S3Bucket":"${BackupBucket}","S3BucketOwner":"${AWS::AccountId}","S3Prefix":"interactions","ExportFormat":"DYNAMODB_JSON","ExportType":"FULL_EXPORT"}'
+        RetryPolicy: {MaximumEventAgeInSeconds: 3600, MaximumRetryAttempts: 3}
+
+  # ---------------------------------------------------------------- Lambda execution roles
+  ApiFunctionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      Description: General ServiceCare API Lambda (every /api/* route). Ticket side effects follow from the tickets stream. No human federation or deployment privileges.
+      PermissionsBoundary: !If [HasPermissionsBoundary, !Ref PermissionsBoundaryArn, !Ref 'AWS::NoValue']
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - !Sub 'arn:${AWS::Partition}:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole'
+      Policies:
+        - PolicyName: servicecare-api-runtime
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Sid: ReadWriteTickets
+                Effect: Allow
+                Action: ['dynamodb:GetItem', 'dynamodb:PutItem']
+                Resource: !GetAtt TicketsTable.Arn
+              - Sid: QueryTicketIndexes
+                Effect: Allow
+                Action: 'dynamodb:Query'
+                Resource:
+                  - !Sub '${TicketsTable.Arn}/index/customer-updated'
+                  - !Sub '${TicketsTable.Arn}/index/queue-updated'
+              - Sid: SaveResolvedInteractions
+                Effect: Allow
+                Action: ['dynamodb:PutItem', 'dynamodb:UpdateItem', 'dynamodb:Scan']
+                Resource: !GetAtt InteractionsTable.Arn
+              - Sid: QueryResolvedInteractions
+                Effect: Allow
+                Action: 'dynamodb:Query'
+                Resource: !Sub '${InteractionsTable.Arn}/index/customer-created'
+              - Sid: ReadWritePrivateEvidence
+                Effect: Allow
+                Action: ['s3:GetObject', 's3:PutObject']
+                Resource: !Sub '${AttachmentsBucket.Arn}/*'
+                Condition:
+                  StringEquals:
+                    's3:ResourceAccount': !Ref 'AWS::AccountId'
+              - !If
+                - HasAnyModel
+                - Sid: InvokeConfiguredModels
+                  Effect: Allow
+                  Action: 'bedrock:InvokeModel'
+                  Resource:
+                    - !If [HasKnowledgeModel, !Ref KnowledgeModelArn, !Ref 'AWS::NoValue']
+                    - !If [HasTriageModel, !Ref TriageModelArn, !Ref 'AWS::NoValue']
+                - !Ref 'AWS::NoValue'
+              - !If
+                - HasKnowledge
+                - Sid: RetrieveConfiguredKnowledge
+                  Effect: Allow
+                  Action: 'bedrock:Retrieve'
+                  Resource: !Sub 'arn:${AWS::Partition}:bedrock:${AWS::Region}:${AWS::AccountId}:knowledge-base/${KnowledgeBaseId}'
+                - !Ref 'AWS::NoValue'
+              - !If
+                - HasAgentCoreHarness
+                - Sid: InvokeConfiguredAgentCoreHarness
+                  Effect: Allow
+                  Action: ['bedrock-agentcore:InvokeHarness', 'bedrock-agentcore:InvokeAgentRuntime']
+                  Resource:
+                    - !Ref AgentCoreHarnessArn
+                    - !If [HasAgentCoreRuntime, !Ref AgentCoreRuntimeArn, !Ref 'AWS::NoValue']
+                    - !If [HasAgentCoreRuntime, !Sub '${AgentCoreRuntimeArn}/runtime-endpoint/DEFAULT', !Ref 'AWS::NoValue']
+                - !Ref 'AWS::NoValue'
+              - !If
+                - HasAgentCoreHarness
+                - Sid: RetrieveConfiguredAgentCoreKnowledge
+                  Effect: Allow
+                  Action: 'bedrock:Retrieve'
+                  Resource: !Sub 'arn:${AWS::Partition}:bedrock:${KnowledgeBaseRegion}:${AWS::AccountId}:knowledge-base/${KnowledgeBaseId}'
+                - !Ref 'AWS::NoValue'
+              - !If
+                - HasQuickSightDashboard
+                - Sid: GenerateQuickSightAdvisorEmbed
+                  Effect: Allow
+                  Action: ['quicksight:GenerateEmbedUrlForAnonymousUser', 'quicksight:GenerateEmbedUrlForRegisteredUser']
+                  Resource:
+                    - !Sub 'arn:${AWS::Partition}:quicksight:us-east-1:${AWS::AccountId}:dashboard/${QuickSightDashboardId}'
+                    - !Sub 'arn:${AWS::Partition}:quicksight:us-east-1:${AWS::AccountId}:user/default/*'
+                - !Ref 'AWS::NoValue'
+              - !If
+                - HasKnowledge
+                - Sid: GenerateGroundedAnswer
+                  Effect: Allow
+                  Action: 'bedrock:RetrieveAndGenerate'
+                  Resource: '*'
+                  Condition:
+                    StringEquals:
+                      'aws:RequestedRegion': !Ref 'AWS::Region'
+                - !Ref 'AWS::NoValue'
+
+  TicketEventsFunctionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      Description: Reads the tickets stream and publishes ticket domain events to the default event bus.
+      PermissionsBoundary: !If [HasPermissionsBoundary, !Ref PermissionsBoundaryArn, !Ref 'AWS::NoValue']
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - !Sub 'arn:${AWS::Partition}:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole'
+      Policies:
+        - PolicyName: servicecare-ticket-events-runtime
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Sid: ReadTicketsStream
+                Effect: Allow
+                Action: ['dynamodb:DescribeStream', 'dynamodb:GetRecords', 'dynamodb:GetShardIterator', 'dynamodb:ListStreams']
+                Resource: !GetAtt TicketsTable.StreamArn
+              - Sid: PublishTicketEvents
+                Effect: Allow
+                Action: 'events:PutEvents'
+                Resource: !Sub 'arn:${AWS::Partition}:events:${AWS::Region}:${AWS::AccountId}:event-bus/default'
+              - Sid: RecordStreamFailures
+                Effect: Allow
+                Action: 'sqs:SendMessage'
+                Resource: !GetAtt TicketEventsDeadLetterQueue.Arn
+
+  TicketActionsFunctionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      Description: Starts the diagnostics workflow for new tickets and emails customers about advisor-side changes.
+      PermissionsBoundary: !If [HasPermissionsBoundary, !Ref PermissionsBoundaryArn, !Ref 'AWS::NoValue']
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - !Sub 'arn:${AWS::Partition}:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole'
+      Policies:
+        - PolicyName: servicecare-ticket-actions-runtime
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Sid: ConsumeTicketActions
+                Effect: Allow
+                Action: ['sqs:ReceiveMessage', 'sqs:DeleteMessage', 'sqs:GetQueueAttributes', 'sqs:ChangeMessageVisibility']
+                Resource: !GetAtt TicketActionsQueue.Arn
+              - Sid: ReadTicket
+                Effect: Allow
+                Action: 'dynamodb:GetItem'
+                Resource: !GetAtt TicketsTable.Arn
+              - !If
+                - HasTriageWorkflow
+                - Sid: StartDiagnosticsWorkflow
+                  Effect: Allow
+                  Action: 'states:StartExecution'
+                  Resource: !Ref TriageWorkflowArn
+                - !Ref 'AWS::NoValue'
+              - !If
+                - HasCustomerEmail
+                - Sid: FindCustomerEmail
+                  Effect: Allow
+                  Action: 'cognito-idp:ListUsers'
+                  Resource: !Sub
+                    - 'arn:${AWS::Partition}:cognito-idp:${PoolRegion}:${AWS::AccountId}:userpool/${CognitoUserPoolId}'
+                    - PoolRegion: !Select [0, !Split ['_', !Ref CognitoUserPoolId]]
+                - !Ref 'AWS::NoValue'
+              - !If
+                - HasCustomerEmail
+                - Sid: EmailCustomerFromApprovedSender
+                  Effect: Allow
+                  Action: 'ses:SendEmail'
+                  Resource: !Sub 'arn:${AWS::Partition}:ses:${AWS::Region}:${AWS::AccountId}:identity/*'
+                  Condition:
+                    StringEquals:
+                      'ses:FromAddress': !Ref CustomerEmailSender
+                - !Ref 'AWS::NoValue'
+
+  # ---------------------------------------------------------------- Lambda functions
+  # Every function is created with a placeholder body; npm run deploy:backend (also run by the pipeline) replaces
+  # the code. The ticket-event placeholders fail on purpose, so stream records and queued actions wait for the real code.
+  ApiFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub '${AWS::StackName}-api'
+      Description: Handles every /api/* route (Hono app).
+      Runtime: nodejs22.x
+      Handler: index.handler
+      Role: !GetAtt ApiFunctionRole.Arn
+      MemorySize: 512
+      Timeout: 29
+      Code:
+        ZipFile: |
+          exports.handler = async () => ({ statusCode: 503, body: JSON.stringify({ error: 'Bootstrap placeholder. Deploy the real build.' }) });
+      Environment:
+        Variables:
+          NODE_ENV: production
+          AWS_NODEJS_CONNECTION_REUSE_ENABLED: '1'
+          AWS_ACCOUNT_ID: !Ref 'AWS::AccountId'
+          TICKETS_TABLE: !Ref TicketsTable
+          INTERACTIONS_TABLE: !Ref InteractionsTable
+          ATTACHMENTS_BUCKET: !Ref AttachmentsBucket
+          WEB_ORIGIN: !Ref WebOrigin
+          ORIGIN_VERIFY_TOKEN: !Ref OriginVerifyToken
+          KNOWLEDGE_BASE_ID: !Ref KnowledgeBaseId
+          AGENTCORE_HARNESS_ARN: !Ref AgentCoreHarnessArn
+          AGENTCORE_MODEL_ID: !Ref AgentCoreModelId
+          QUICKSIGHT_DASHBOARD_ID: !Ref QuickSightDashboardId
+          QUICKSIGHT_REGION: us-east-1
+          QUICKSIGHT_EMBED_USER_ARN: !Ref QuickSightEmbedUserArn
+          KNOWLEDGE_MODEL_ARN: !Ref KnowledgeModelArn
+          TRIAGE_MODEL_ID: !Ref TriageModelArn
+          CUSTOMER_DASHBOARD_URL: !Ref CustomerDashboardUrl
+
+  TicketEventsFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub '${AWS::StackName}-ticket-events'
+      Description: Turns tickets table stream records into ticket domain events on the default event bus.
+      Runtime: nodejs22.x
+      Handler: stream.handler
+      Role: !GetAtt TicketEventsFunctionRole.Arn
+      MemorySize: 256
+      Timeout: 30
+      Code:
+        ZipFile: |
+          exports.handler = async () => { throw new Error('Bootstrap placeholder. Run npm run deploy:backend.'); };
+      Environment:
+        Variables:
+          NODE_ENV: production
+          AWS_NODEJS_CONNECTION_REUSE_ENABLED: '1'
+          EVENT_BUS_NAME: default
+
+  # LATEST + ordered retries: a record is retried until it is published or 24 hours old, then recorded in the DLQ.
+  TicketEventsStreamMapping:
+    Type: AWS::Lambda::EventSourceMapping
+    Properties:
+      EventSourceArn: !GetAtt TicketsTable.StreamArn
+      FunctionName: !Ref TicketEventsFunction
+      StartingPosition: LATEST
+      BatchSize: 25
+      MaximumBatchingWindowInSeconds: 1
+      ParallelizationFactor: 1
+      BisectBatchOnFunctionError: true
+      MaximumRetryAttempts: -1
+      MaximumRecordAgeInSeconds: 86400
+      FunctionResponseTypes: [ReportBatchItemFailures]
+      DestinationConfig:
+        OnFailure:
+          Destination: !GetAtt TicketEventsDeadLetterQueue.Arn
+
+  TicketActionsFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub '${AWS::StackName}-ticket-actions'
+      Description: Starts the diagnostics workflow for new tickets and emails customers about advisor-side changes.
+      Runtime: nodejs22.x
+      Handler: worker.handler
+      Role: !GetAtt TicketActionsFunctionRole.Arn
+      MemorySize: 256
+      Timeout: 30
+      Code:
+        ZipFile: |
+          exports.handler = async () => { throw new Error('Bootstrap placeholder. Run npm run deploy:backend.'); };
+      Environment:
+        Variables:
+          NODE_ENV: production
+          AWS_NODEJS_CONNECTION_REUSE_ENABLED: '1'
+          TICKETS_TABLE: !Ref TicketsTable
+          TRIAGE_WORKFLOW_ARN: !Ref TriageWorkflowArn
+          CUSTOMER_EMAIL_SENDER: !Ref CustomerEmailSender
+          COGNITO_USER_POOL_ID: !Ref CognitoUserPoolId
+          WEB_ORIGIN: !Ref WebOrigin
+
+  TicketActionsQueueMapping:
+    Type: AWS::Lambda::EventSourceMapping
+    Properties:
+      EventSourceArn: !GetAtt TicketActionsQueue.Arn
+      FunctionName: !Ref TicketActionsFunction
+      BatchSize: 10
+      FunctionResponseTypes: [ReportBatchItemFailures]
+
+  ApiFunctionLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub '/aws/lambda/${ApiFunction}'
+      RetentionInDays: !Ref LogRetentionDays
+
+  TicketEventsFunctionLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub '/aws/lambda/${TicketEventsFunction}'
+      RetentionInDays: !Ref LogRetentionDays
+
+  TicketActionsFunctionLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub '/aws/lambda/${TicketActionsFunction}'
+      RetentionInDays: !Ref LogRetentionDays
+
+  # ---------------------------------------------------------------- HTTP API
+  HttpApi:
+    Type: AWS::ApiGatewayV2::Api
+    Properties:
+      Name: !Sub '${AWS::StackName}-api'
+      ProtocolType: HTTP
+
+  CognitoAuthorizer:
+    Type: AWS::ApiGatewayV2::Authorizer
+    Properties:
+      ApiId: !Ref HttpApi
+      AuthorizerType: JWT
+      Name: cognito-jwt
+      IdentitySource: ['$request.header.Authorization']
+      JwtConfiguration:
+        Audience: !Ref CognitoClientIds
+        # The user pool can live in a different region than this stack (e.g. eu-north-1 vs us-east-1),
+        # so the issuer's region must come from the pool ID prefix, not ${AWS::Region}.
+        Issuer: !Sub
+          - 'https://cognito-idp.${PoolRegion}.amazonaws.com/${CognitoUserPoolId}'
+          - PoolRegion: !Select [0, !Split ['_', !Ref CognitoUserPoolId]]
+
+  ApiFunctionIntegration:
+    Type: AWS::ApiGatewayV2::Integration
+    Properties:
+      ApiId: !Ref HttpApi
+      IntegrationType: AWS_PROXY
+      IntegrationUri: !GetAtt ApiFunction.Arn
+      PayloadFormatVersion: '2.0'
+      TimeoutInMillis: 29000
+
+  HealthRoute:
+    Type: AWS::ApiGatewayV2::Route
+    Properties:
+      ApiId: !Ref HttpApi
+      RouteKey: 'GET /api/health'
+      AuthorizationType: NONE
+      Target: !Sub 'integrations/${ApiFunctionIntegration}'
+
+  ApiProxyRoute:
+    Type: AWS::ApiGatewayV2::Route
+    Properties:
+      ApiId: !Ref HttpApi
+      RouteKey: 'ANY /api/{proxy+}'
+      AuthorizationType: JWT
+      AuthorizerId: !Ref CognitoAuthorizer
+      Target: !Sub 'integrations/${ApiFunctionIntegration}'
+
+  DefaultStage:
+    Type: AWS::ApiGatewayV2::Stage
+    Properties:
+      ApiId: !Ref HttpApi
+      StageName: '$default'
+      AutoDeploy: true
+
+  ApiFunctionInvokePermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref ApiFunction
+      Action: lambda:InvokeFunction
+      Principal: apigateway.amazonaws.com
+      SourceArn: !Sub 'arn:${AWS::Partition}:execute-api:${AWS::Region}:${AWS::AccountId}:${HttpApi}/*/*'
+
+  # ---------------------------------------------------------------- deployment identity
+  DeployRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub '${AWS::StackName}-deploy'
+      Description: Backend Lambda code publishing (npm run deploy:backend) from GitHub Actions through OIDC; usable only from the configured repository and branch.
+      MaxSessionDuration: 3600
+      PermissionsBoundary: !If [HasPermissionsBoundary, !Ref PermissionsBoundaryArn, !Ref 'AWS::NoValue']
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Federated: !Sub 'arn:${AWS::Partition}:iam::${AWS::AccountId}:oidc-provider/token.actions.githubusercontent.com'
+            Action: sts:AssumeRoleWithWebIdentity
+            Condition:
+              StringEquals:
+                'token.actions.githubusercontent.com:aud': sts.amazonaws.com
+                'token.actions.githubusercontent.com:sub': !Sub 'repo:${GitHubRepository}:ref:refs/heads/${GitHubBranch}'
+      Policies:
+        - PolicyName: deploy-backend
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Sid: UpdateFunctionCode
+                Effect: Allow
+                Action:
+                  - 'lambda:UpdateFunctionCode'
+                  - 'lambda:GetFunction'
+                  - 'lambda:GetFunctionConfiguration'
+                  - 'lambda:PublishVersion'
+                Resource:
+                  - !GetAtt ApiFunction.Arn
+                  - !GetAtt TicketEventsFunction.Arn
+                  - !GetAtt TicketActionsFunction.Arn
+              - Sid: WaitForUpdateToFinish
+                Effect: Allow
+                Action: 'lambda:GetFunction'
+                Resource: '*'
+              - Sid: ReadThisStacksOutputs
+                Effect: Allow
+                Action: 'cloudformation:DescribeStacks'
+                Resource: !Ref 'AWS::StackId'
+
+Outputs:
+  ApiGatewayDomainName:
+    Description: Set this as ApiOriginDomainName in the frontend stack to route /api/* here.
+    Value: !Select [2, !Split ['/', !GetAtt HttpApi.ApiEndpoint]]
+  ApiFunctionName:
+    Value: !Ref ApiFunction
+  TicketEventsFunctionName:
+    Value: !Ref TicketEventsFunction
+  TicketActionsFunctionName:
+    Value: !Ref TicketActionsFunction
+  TicketEventsDeadLetterQueueUrl:
+    Description: Undeliverable ticket events and actions. Inspect, then redrive to the ticket actions queue.
+    Value: !Ref TicketEventsDeadLetterQueue
+  BackupBucket:
+    Description: Daily DynamoDB exports of the tickets (tickets/) and interactions (interactions/) tables.
+    Value: !Ref BackupBucket
+  DeployRoleArn:
+    Value: !GetAtt DeployRole.Arn
+  TicketsTable:
+    Value: !Ref TicketsTable
+  InteractionsTable:
+    Value: !Ref InteractionsTable
+  AttachmentsBucket:
+    Value: !Ref AttachmentsBucket
+  NotificationsTopicArn:
+    Description: Advisor alerts (new tickets, customer replies). Subscribe approved advisor email addresses to this topic.
+    Value: !Ref NotificationsTopic
+

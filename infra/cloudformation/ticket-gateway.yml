@@ -1,0 +1,309 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: Isolated Cognito-authenticated ticket gateway and agent action broker. Existing gateways and ticket APIs are unchanged.
+Parameters:
+  EnableTicketTarget:
+    Type: String
+    Default: 'false'
+    AllowedValues: ['true', 'false']
+  EnableTicketWrites:
+    Type: String
+    Default: 'false'
+    AllowedValues: ['true', 'false']
+  ExpectedGatewayId:
+    Type: String
+    Default: ''
+  TicketGatewayUrl:
+    Type: String
+    Default: ''
+  WebOrigin:
+    Type: String
+    Default: http://localhost:5173
+  CognitoUserPoolId:
+    Type: String
+  CognitoClientIds:
+    Type: CommaDelimitedList
+  CognitoIssuer:
+    Type: String
+  TicketsTableName:
+    Type: String
+  InteractionsTableName:
+    Type: String
+  AttachmentsBucketName:
+    Type: String
+  CustomerDashboardUrl:
+    Type: String
+  VisualApiUrl:
+    Type: String
+  HarnessArn:
+    Type: String
+  RuntimeArn:
+    Type: String
+Conditions:
+  TicketTargetEnabled: !Equals [!Ref EnableTicketTarget, 'true']
+Resources:
+  InterceptorLogs:
+    Type: AWS::Logs::LogGroup
+    # checkov:skip=CKV_AWS_158:Short-lived dev gateway logs use CloudWatch service-managed encryption; no prompts or tokens are logged.
+    Properties: {RetentionInDays: 14}
+  ToolLogs:
+    Type: AWS::Logs::LogGroup
+    # checkov:skip=CKV_AWS_158:Short-lived dev gateway logs use CloudWatch service-managed encryption; no prompts or tokens are logged.
+    Properties: {RetentionInDays: 14}
+  BrokerLogs:
+    Type: AWS::Logs::LogGroup
+    # checkov:skip=CKV_AWS_158:Short-lived dev gateway logs use CloudWatch service-managed encryption; no prompts or tokens are logged.
+    Properties: {RetentionInDays: 14}
+  AccessLogs:
+    Type: AWS::Logs::LogGroup
+    # checkov:skip=CKV_AWS_158:Short-lived dev access logs contain only request ID/status and use service-managed encryption.
+    Properties: {RetentionInDays: 14}
+  InterceptorRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement: [{Effect: Allow, Principal: {Service: lambda.amazonaws.com}, Action: sts:AssumeRole}]
+      Policies:
+        - PolicyName: InterceptorLogsOnly
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement: [{Effect: Allow, Action: [logs:CreateLogStream, logs:PutLogEvents], Resource: !Sub '${InterceptorLogs.Arn}:*'}]
+  ToolRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement: [{Effect: Allow, Principal: {Service: lambda.amazonaws.com}, Action: sts:AssumeRole}]
+      Policies:
+        # Writes only the ticket; advisor alerts, customer emails and the diagnostics workflow follow from the tickets
+        # table stream in the backend stack, exactly as for tickets created through POST /api/tickets.
+        - PolicyName: ExistingTicketOperationsOnly
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action: [dynamodb:GetItem, dynamodb:PutItem]
+                Resource: !Sub arn:${AWS::Partition}:dynamodb:${AWS::Region}:${AWS::AccountId}:table/${TicketsTableName}
+              - Effect: Allow
+                Action: s3:GetObject
+                Resource: !Sub arn:${AWS::Partition}:s3:::${AttachmentsBucketName}/*
+              - Effect: Allow
+                Action: [logs:CreateLogStream, logs:PutLogEvents]
+                Resource: !Sub '${ToolLogs.Arn}:*'
+  BrokerRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement: [{Effect: Allow, Principal: {Service: lambda.amazonaws.com}, Action: sts:AssumeRole}]
+      Policies:
+        - PolicyName: HarnessActionOnly
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action: [bedrock-agentcore:InvokeHarness, bedrock-agentcore:InvokeAgentRuntime]
+                Resource: [!Ref HarnessArn, !Ref RuntimeArn, !Sub '${RuntimeArn}/runtime-endpoint/DEFAULT']
+              - Effect: Allow
+                Action: [logs:CreateLogStream, logs:PutLogEvents]
+                Resource: !Sub '${BrokerLogs.Arn}:*'
+  InterceptorFunction:
+    Type: AWS::Lambda::Function
+    # checkov:skip=CKV_AWS_116:Synchronous AgentCore interception returns errors to the caller; no asynchronous events are accepted.
+    # checkov:skip=CKV_AWS_117:No VPC egress/NAT exists in this account; the interceptor uses Cognito public TLS endpoints only.
+    # checkov:skip=CKV_AWS_173:Environment values are public pool/client IDs and boolean flags; Lambda uses service encryption at rest.
+    Properties:
+      Runtime: nodejs22.x
+      Handler: index.interceptorHandler
+      Role: !GetAtt InterceptorRole.Arn
+      Timeout: 10
+      MemorySize: 256
+      ReservedConcurrentExecutions: 5
+      LoggingConfig: {LogGroup: !Ref InterceptorLogs}
+      Code:
+        ZipFile: |
+          exports.interceptorHandler = async () => ({ interceptorOutputVersion: '1.0', mcp: { transformedGatewayResponse: { statusCode: 403, body: { error: 'Deploy validated code first.' } } } });
+      Environment:
+        Variables:
+          COGNITO_USER_POOL_ID: !Ref CognitoUserPoolId
+          COGNITO_CLIENT_IDS: !Join [',', !Ref CognitoClientIds]
+          AGENT_TICKET_WRITES_ENABLED: !Ref EnableTicketWrites
+  ToolFunction:
+    Type: AWS::Lambda::Function
+    # checkov:skip=CKV_AWS_116:Synchronous Gateway target invocation returns errors to the caller; no asynchronous events are accepted.
+    # checkov:skip=CKV_AWS_117:No VPC egress/NAT exists in this account; the adapter uses approved public AWS service TLS endpoints.
+    # checkov:skip=CKV_AWS_173:Environment values are ARNs, table/bucket names and feature flags; Lambda uses service encryption at rest.
+    Properties:
+      Runtime: nodejs22.x
+      Handler: index.toolHandler
+      Role: !GetAtt ToolRole.Arn
+      Timeout: 28
+      MemorySize: 512
+      ReservedConcurrentExecutions: 5
+      LoggingConfig: {LogGroup: !Ref ToolLogs}
+      Code:
+        ZipFile: |
+          exports.toolHandler = async () => ({ ok: false, error: 'Deploy validated code first.' });
+      Environment:
+        Variables:
+          COGNITO_USER_POOL_ID: !Ref CognitoUserPoolId
+          COGNITO_CLIENT_IDS: !Join [',', !Ref CognitoClientIds]
+          EXPECTED_GATEWAY_ID: !Ref ExpectedGatewayId
+          AGENT_TICKET_WRITES_ENABLED: !Ref EnableTicketWrites
+          TICKETS_TABLE: !Ref TicketsTableName
+          INTERACTIONS_TABLE: !Ref InteractionsTableName
+          ATTACHMENTS_BUCKET: !Ref AttachmentsBucketName
+          CUSTOMER_DASHBOARD_URL: !Ref CustomerDashboardUrl
+          VISUAL_API_URL: !Ref VisualApiUrl
+  BrokerFunction:
+    Type: AWS::Lambda::Function
+    # checkov:skip=CKV_AWS_116:Synchronous authenticated HTTP API invokes the broker and returns failures directly.
+    # checkov:skip=CKV_AWS_117:No VPC egress/NAT exists in this account; the broker calls the public AgentCore endpoint over TLS.
+    # checkov:skip=CKV_AWS_173:Environment values are public AWS ARNs/URLs and feature flags; no credentials are stored in env.
+    Properties:
+      Runtime: nodejs22.x
+      Handler: index.httpHandler
+      Role: !GetAtt BrokerRole.Arn
+      Timeout: 28
+      MemorySize: 512
+      ReservedConcurrentExecutions: 5
+      LoggingConfig: {LogGroup: !Ref BrokerLogs}
+      Code:
+        ZipFile: |
+          exports.httpHandler = async () => ({ statusCode: 503, body: JSON.stringify({ error: 'Deploy validated code first.' }) });
+      Environment:
+        Variables:
+          COGNITO_USER_POOL_ID: !Ref CognitoUserPoolId
+          COGNITO_CLIENT_IDS: !Join [',', !Ref CognitoClientIds]
+          AGENT_TICKET_WRITES_ENABLED: !Ref EnableTicketWrites
+          AGENTCORE_HARNESS_ARN: !Ref HarnessArn
+          TICKET_GATEWAY_URL: !Ref TicketGatewayUrl
+          WEB_ORIGIN: !Ref WebOrigin
+          TICKETS_TABLE: !Ref TicketsTableName
+          INTERACTIONS_TABLE: !Ref InteractionsTableName
+  GatewayRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal: {Service: bedrock-agentcore.amazonaws.com}
+            Action: sts:AssumeRole
+            Condition: {StringEquals: {aws:SourceAccount: !Ref AWS::AccountId}}
+      Policies:
+        - PolicyName: InvokeOnlyTicketFunctions
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action: lambda:InvokeFunction
+                Resource: [!GetAtt ToolFunction.Arn, !GetAtt InterceptorFunction.Arn]
+  Gateway:
+    Type: AWS::BedrockAgentCore::Gateway
+    Properties:
+      Name: ServiceCareTicketGateway
+      RoleArn: !GetAtt GatewayRole.Arn
+      ProtocolType: MCP
+      AuthorizerType: CUSTOM_JWT
+      AuthorizerConfiguration:
+        CustomJWTAuthorizer:
+          DiscoveryUrl: !Sub '${CognitoIssuer}/.well-known/openid-configuration'
+          AllowedClients: !Ref CognitoClientIds
+      InterceptorConfigurations:
+        - InterceptionPoints: [REQUEST]
+          Interceptor: {Lambda: {Arn: !GetAtt InterceptorFunction.Arn}}
+          InputConfiguration: {PassRequestHeaders: true}
+  TicketTarget:
+    Type: AWS::BedrockAgentCore::GatewayTarget
+    Condition: TicketTargetEnabled
+    Properties:
+      Name: ticketbackend
+      GatewayIdentifier: !Ref Gateway
+      CredentialProviderConfigurations: [{CredentialProviderType: GATEWAY_IAM_ROLE}]
+      TargetConfiguration:
+        Mcp:
+          Lambda:
+            LambdaArn: !GetAtt ToolFunction.Arn
+            ToolSchema:
+              InlinePayload:
+                - Name: create_ticket
+                  Description: Create a real ticket only from confirmed unchanged input; vehicle ownership and duplicate protection are enforced.
+                  InputSchema:
+                    Type: object
+                    Required: [title, description, vin]
+                    Properties:
+                      title: {Type: string}
+                      description: {Type: string}
+                      vin: {Type: string}
+                      knowledgeBaseAttempted: {Type: boolean}
+                      visualSessionId: {Type: string}
+                - Name: get_ticket
+                  Description: Read a ticket allowed by the authenticated customer's or advisor's access.
+                  InputSchema: {Type: object, Required: [ticketId], Properties: {ticketId: {Type: string}}}
+                - Name: update_ticket
+                  Description: Advisor-only status or priority change, subject to state transition and version checks.
+                  InputSchema: {Type: object, Required: [ticketId, version], Properties: {ticketId: {Type: string}, version: {Type: integer}, status: {Type: string}, priority: {Type: string}}}
+                - Name: assign_advisor
+                  Description: Assign the ticket to the authenticated advisor; no arbitrary advisor identity is accepted.
+                  InputSchema: {Type: object, Required: [ticketId, version], Properties: {ticketId: {Type: string}, version: {Type: integer}}}
+  HttpApi:
+    Type: AWS::ApiGatewayV2::Api
+    Properties:
+      Name: !Sub '${AWS::StackName}-actions'
+      ProtocolType: HTTP
+      CorsConfiguration: {AllowOrigins: [!Ref WebOrigin], AllowMethods: [POST, OPTIONS], AllowHeaders: [Content-Type, Authorization]}
+  Authorizer:
+    Type: AWS::ApiGatewayV2::Authorizer
+    Properties:
+      ApiId: !Ref HttpApi
+      Name: CustomerAndAdvisor
+      AuthorizerType: JWT
+      IdentitySource: ['$request.header.Authorization']
+      JwtConfiguration: {Audience: !Ref CognitoClientIds, Issuer: !Ref CognitoIssuer}
+  Integration:
+    Type: AWS::ApiGatewayV2::Integration
+    Properties:
+      ApiId: !Ref HttpApi
+      IntegrationType: AWS_PROXY
+      IntegrationUri: !GetAtt BrokerFunction.Arn
+      PayloadFormatVersion: '2.0'
+  ActionRoute:
+    Type: AWS::ApiGatewayV2::Route
+    Properties:
+      ApiId: !Ref HttpApi
+      RouteKey: POST /agent/ticket-action
+      AuthorizationType: JWT
+      AuthorizerId: !Ref Authorizer
+      Target: !Sub integrations/${Integration}
+  PreflightRoute:
+    Type: AWS::ApiGatewayV2::Route
+    Properties:
+      ApiId: !Ref HttpApi
+      RouteKey: OPTIONS /agent/{proxy+}
+      AuthorizationType: NONE
+      Target: !Sub integrations/${Integration}
+  Stage:
+    Type: AWS::ApiGatewayV2::Stage
+    Properties:
+      ApiId: !Ref HttpApi
+      StageName: '$default'
+      AutoDeploy: true
+      DefaultRouteSettings: {ThrottlingBurstLimit: 5, ThrottlingRateLimit: 2}
+      AccessLogSettings:
+        DestinationArn: !GetAtt AccessLogs.Arn
+        Format: '{"requestId":"$context.requestId","status":"$context.status"}'
+  BrokerPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref BrokerFunction
+      Principal: apigateway.amazonaws.com
+      Action: lambda:InvokeFunction
+      SourceArn: !Sub arn:${AWS::Partition}:execute-api:${AWS::Region}:${AWS::AccountId}:${HttpApi}/*/*/agent/*
+Outputs:
+  GatewayId: {Value: !Ref Gateway}
+  GatewayUrl: {Value: !GetAtt Gateway.GatewayUrl}
+  AgentTicketApiUrl: {Value: !GetAtt HttpApi.ApiEndpoint}
+  InterceptorFunctionName: {Value: !Ref InterceptorFunction}
+  ToolFunctionName: {Value: !Ref ToolFunction}
+  BrokerFunctionName: {Value: !Ref BrokerFunction}

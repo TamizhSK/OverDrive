@@ -1,0 +1,429 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >-
+  ServiceCare advisor QuickSight dashboard. The data pipeline (DynamoDB Streams -> Lambda -> Firehose -> S3 Parquet,
+  Glue database overdrive, Athena workgroup servicecare-analytics) is owned by infra/analytics (Terraform). This stack
+  only defines the aggregate datasets and the embeddable advisor dashboard on top of overdrive.ticket_events.
+
+Parameters:
+  QuickSightDataSourceId:
+    Type: String
+    Default: a14ef327-c6f6-4469-bbf2-4d15195ebd3e
+    Description: Existing QuickSight Athena data source (workgroup servicecare-analytics) to reuse.
+  QuickSightOwnerArn:
+    Type: String
+    Default: ''
+    Description: Optional ARN of the QuickSight user or group that can edit the datasets and dashboard. Anonymous embedding does not need it.
+  QuickSightReaderArn:
+    Type: String
+    Description: QuickSight reader user the API Lambda embeds the dashboard as.
+  GlueDatabase:
+    Type: String
+    Default: overdrive
+
+Conditions:
+  HasOwner: !Not [!Equals [!Ref QuickSightOwnerArn, '']]
+
+Resources:
+  QuickSightDataSet:
+    Type: AWS::QuickSight::DataSet
+    Properties:
+      AwsAccountId: !Ref 'AWS::AccountId'
+      DataSetId: servicecare-advisor-metrics
+      Name: ServiceCare advisor metrics
+      ImportMode: DIRECT_QUERY
+      Permissions: !If
+        - HasOwner
+        - - Principal: !Ref QuickSightOwnerArn
+            Actions: [quicksight:DescribeDataSet, quicksight:DescribeDataSetPermissions, quicksight:PassDataSet, quicksight:DescribeIngestion, quicksight:ListIngestions, quicksight:UpdateDataSet, quicksight:DeleteDataSet, quicksight:UpdateDataSetPermissions]
+        - !Ref AWS::NoValue
+      PhysicalTableMap:
+        AggregateMetrics:
+          CustomSql:
+            DataSourceArn: !Sub 'arn:${AWS::Partition}:quicksight:${AWS::Region}:${AWS::AccountId}:datasource/${QuickSightDataSourceId}'
+            Name: Advisor metrics
+            SqlQuery: !Sub |
+              WITH latest AS (
+                SELECT entity_type, entity_id, status, priority, resolved, phase, critical, safety_concern, image_analysis_ready, is_deleted,
+                       row_number() OVER (PARTITION BY entity_type, entity_id ORDER BY event_time DESC, CAST(sequence_number AS DECIMAL(38,0)) DESC) AS row_num
+                FROM ${GlueDatabase}.ticket_events
+                WHERE event_date >= date_format(current_date - interval '90' day, '%Y-%m-%d')
+              ), current_records AS (
+                SELECT entity_type, status, priority, resolved, phase, critical, safety_concern, image_analysis_ready
+                FROM latest WHERE row_num = 1 AND coalesce(is_deleted, false) = false
+              )
+              SELECT CAST(count_if(entity_type = 'ticket' AND status IN ('OPEN','ASSIGNED','IN_PROGRESS','WAITING_FOR_CUSTOMER')) AS integer) AS open_tickets,
+                     CAST(count_if(entity_type = 'ticket' AND status = 'OPEN') AS integer) AS unassigned_tickets,
+                     CAST(count_if(entity_type = 'ticket' AND priority IN ('HIGH','CRITICAL') AND status NOT IN ('RESOLVED','CLOSED')) AS integer) AS high_priority_open,
+                     CAST(count_if(entity_type = 'ticket' AND status = 'WAITING_FOR_CUSTOMER') AS integer) AS waiting_for_customer,
+                     CAST(count_if(entity_type = 'ticket' AND status IN ('RESOLVED','CLOSED')) AS integer) AS resolved_tickets,
+                     CAST(count_if(entity_type = 'assistant_interaction') AS integer) AS assistant_conversations,
+                     CAST(count_if(entity_type = 'assistant_interaction' AND resolved = true) AS integer) AS self_service_resolved,
+                     CAST(round(100.0 * count_if(entity_type = 'assistant_interaction' AND resolved = true) / greatest(count_if(entity_type = 'assistant_interaction'), 1)) AS integer) AS self_service_rate_pct,
+                     CAST(count_if(entity_type = 'visual_session' AND image_analysis_ready = true) AS integer) AS photo_analyses,
+                     CAST(count_if(entity_type = 'visual_session' AND (critical = true OR safety_concern = true) AND phase <> 'RESOLVED') AS integer) AS safety_photo_reviews
+              FROM current_records
+            Columns:
+              - { Name: open_tickets, Type: INTEGER }
+              - { Name: unassigned_tickets, Type: INTEGER }
+              - { Name: high_priority_open, Type: INTEGER }
+              - { Name: waiting_for_customer, Type: INTEGER }
+              - { Name: resolved_tickets, Type: INTEGER }
+              - { Name: assistant_conversations, Type: INTEGER }
+              - { Name: self_service_resolved, Type: INTEGER }
+              - { Name: self_service_rate_pct, Type: INTEGER }
+              - { Name: photo_analyses, Type: INTEGER }
+              - { Name: safety_photo_reviews, Type: INTEGER }
+      LogicalTableMap:
+        AdvisorMetrics:
+          Alias: Advisor metrics
+          Source:
+            PhysicalTableId: AggregateMetrics
+
+  QuickSightBreakdownDataSet:
+    Type: AWS::QuickSight::DataSet
+    Properties:
+      AwsAccountId: !Ref 'AWS::AccountId'
+      DataSetId: servicecare-advisor-ticket-breakdown
+      Name: ServiceCare ticket breakdown
+      ImportMode: DIRECT_QUERY
+      Permissions: !If
+        - HasOwner
+        - - Principal: !Ref QuickSightOwnerArn
+            Actions: [quicksight:DescribeDataSet, quicksight:DescribeDataSetPermissions, quicksight:PassDataSet, quicksight:DescribeIngestion, quicksight:ListIngestions, quicksight:UpdateDataSet, quicksight:DeleteDataSet, quicksight:UpdateDataSetPermissions]
+        - !Ref AWS::NoValue
+      PhysicalTableMap:
+        TicketBreakdown:
+          CustomSql:
+            DataSourceArn: !Sub 'arn:${AWS::Partition}:quicksight:${AWS::Region}:${AWS::AccountId}:datasource/${QuickSightDataSourceId}'
+            Name: Ticket breakdown
+            SqlQuery: !Sub |
+              WITH latest AS (
+                SELECT entity_id, status, priority, category, is_deleted,
+                       row_number() OVER (PARTITION BY entity_id ORDER BY event_time DESC, CAST(sequence_number AS DECIMAL(38,0)) DESC) AS row_num
+                FROM ${GlueDatabase}.ticket_events
+                WHERE entity_type = 'ticket'
+                  AND event_date >= date_format(current_date - interval '90' day, '%Y-%m-%d')
+              )
+              SELECT coalesce(status, 'UNKNOWN') AS status,
+                     coalesce(priority, 'UNKNOWN') AS priority,
+                     coalesce(category, 'UNKNOWN') AS category,
+                     CAST(count(*) AS integer) AS ticket_count
+              FROM latest
+              WHERE row_num = 1 AND coalesce(is_deleted, false) = false
+              GROUP BY 1, 2, 3
+            Columns:
+              - { Name: status, Type: STRING }
+              - { Name: priority, Type: STRING }
+              - { Name: category, Type: STRING }
+              - { Name: ticket_count, Type: INTEGER }
+      LogicalTableMap:
+        TicketBreakdown:
+          Alias: Ticket breakdown
+          Source:
+            PhysicalTableId: TicketBreakdown
+
+  QuickSightResolutionDataSet:
+    Type: AWS::QuickSight::DataSet
+    Properties:
+      AwsAccountId: !Ref 'AWS::AccountId'
+      DataSetId: servicecare-advisor-resolution-time
+      Name: ServiceCare resolution time
+      ImportMode: DIRECT_QUERY
+      Permissions: !If
+        - HasOwner
+        - - Principal: !Ref QuickSightOwnerArn
+            Actions: [quicksight:DescribeDataSet, quicksight:DescribeDataSetPermissions, quicksight:PassDataSet, quicksight:DescribeIngestion, quicksight:ListIngestions, quicksight:UpdateDataSet, quicksight:DeleteDataSet, quicksight:UpdateDataSetPermissions]
+        - !Ref AWS::NoValue
+      PhysicalTableMap:
+        ResolutionTime:
+          CustomSql:
+            DataSourceArn: !Sub 'arn:${AWS::Partition}:quicksight:${AWS::Region}:${AWS::AccountId}:datasource/${QuickSightDataSourceId}'
+            Name: Resolution time
+            SqlQuery: !Sub |
+              SELECT coalesce(category, 'UNKNOWN') AS category,
+                     CAST(count(*) AS integer) AS resolved_count,
+                     CAST(round(avg(date_diff('minute', from_iso8601_timestamp(opened_at), from_iso8601_timestamp(event_time))) / 60.0, 1) AS double) AS avg_resolution_hours
+              FROM ${GlueDatabase}.ticket_events
+              WHERE entity_type = 'ticket' AND ticket_resolved = true AND opened_at IS NOT NULL
+                AND event_date >= date_format(current_date - interval '90' day, '%Y-%m-%d')
+              GROUP BY 1
+            Columns:
+              - { Name: category, Type: STRING }
+              - { Name: resolved_count, Type: INTEGER }
+              - { Name: avg_resolution_hours, Type: DECIMAL }
+      LogicalTableMap:
+        ResolutionTime:
+          Alias: Resolution time
+          Source:
+            PhysicalTableId: ResolutionTime
+
+  QuickSightTrendDataSet:
+    Type: AWS::QuickSight::DataSet
+    Properties:
+      AwsAccountId: !Ref 'AWS::AccountId'
+      DataSetId: servicecare-advisor-ticket-trends
+      Name: ServiceCare ticket trends
+      ImportMode: DIRECT_QUERY
+      Permissions: !If
+        - HasOwner
+        - - Principal: !Ref QuickSightOwnerArn
+            Actions: [quicksight:DescribeDataSet, quicksight:DescribeDataSetPermissions, quicksight:PassDataSet, quicksight:DescribeIngestion, quicksight:ListIngestions, quicksight:UpdateDataSet, quicksight:DeleteDataSet, quicksight:UpdateDataSetPermissions]
+        - !Ref AWS::NoValue
+      PhysicalTableMap:
+        DailyTicketActivity:
+          CustomSql:
+            DataSourceArn: !Sub 'arn:${AWS::Partition}:quicksight:${AWS::Region}:${AWS::AccountId}:datasource/${QuickSightDataSourceId}'
+            Name: Daily ticket activity
+            SqlQuery: !Sub |
+              WITH deduped_events AS (
+                SELECT event_id, event_date, ticket_created, ticket_resolved,
+                       row_number() OVER (PARTITION BY event_id ORDER BY event_time DESC, CAST(sequence_number AS DECIMAL(38,0)) DESC) AS event_row
+                FROM ${GlueDatabase}.ticket_events
+                WHERE entity_type = 'ticket'
+                  AND event_date >= date_format(current_date - interval '90' day, '%Y-%m-%d')
+              )
+              SELECT event_date,
+                     CAST(count_if(ticket_created = true) AS integer) AS tickets_opened,
+                     CAST(count_if(ticket_resolved = true) AS integer) AS tickets_resolved
+              FROM deduped_events
+              WHERE event_row = 1
+              GROUP BY event_date
+            Columns:
+              - { Name: event_date, Type: STRING }
+              - { Name: tickets_opened, Type: INTEGER }
+              - { Name: tickets_resolved, Type: INTEGER }
+      LogicalTableMap:
+        DailyTicketActivity:
+          Alias: Daily ticket activity
+          Source:
+            PhysicalTableId: DailyTicketActivity
+
+  QuickSightDashboard:
+    Type: AWS::QuickSight::Dashboard
+    Properties:
+      AwsAccountId: !Ref 'AWS::AccountId'
+      DashboardId: servicecare-advisor-analytics
+      Name: ServiceCare advisor analytics
+      VersionDescription: Advisor KPI dashboard
+      Permissions: !If
+        - HasOwner
+        - - Principal: !Ref QuickSightReaderArn
+            Actions: [quicksight:DescribeDashboard, quicksight:ListDashboardVersions, quicksight:QueryDashboard]
+          - Principal: !Ref QuickSightOwnerArn
+            Actions: [quicksight:DescribeDashboard, quicksight:ListDashboardVersions, quicksight:QueryDashboard, quicksight:UpdateDashboard, quicksight:DeleteDashboard, quicksight:UpdateDashboardPublishedVersion, quicksight:DescribeDashboardPermissions, quicksight:UpdateDashboardPermissions]
+        - - Principal: !Ref QuickSightReaderArn
+            Actions: [quicksight:DescribeDashboard, quicksight:ListDashboardVersions, quicksight:QueryDashboard]
+      DashboardPublishOptions:
+        ExportToCSVOption:
+          AvailabilityStatus: DISABLED
+        AdHocFilteringOption:
+          AvailabilityStatus: DISABLED
+      Definition:
+        DataSetIdentifierDeclarations:
+          - Identifier: Analytics
+            DataSetArn: !GetAtt QuickSightDataSet.Arn
+          - Identifier: TicketTrends
+            DataSetArn: !GetAtt QuickSightTrendDataSet.Arn
+          - Identifier: Breakdown
+            DataSetArn: !GetAtt QuickSightBreakdownDataSet.Arn
+          - Identifier: Resolution
+            DataSetArn: !GetAtt QuickSightResolutionDataSet.Arn
+        Sheets:
+          - SheetId: advisor-metrics
+            Name: Advisor overview
+            Title: Service operations
+            Layouts:
+              - Configuration:
+                  GridLayout:
+                    CanvasSizeOptions:
+                      ScreenCanvasSizeOptions:
+                        ResizeOption: RESPONSIVE
+                    Elements:
+                      - { ElementId: kpi-open, ElementType: VISUAL, RowIndex: 0, ColumnIndex: 0, ColumnSpan: 9, RowSpan: 5 }
+                      - { ElementId: kpi-high-priority, ElementType: VISUAL, RowIndex: 0, ColumnIndex: 9, ColumnSpan: 9, RowSpan: 5 }
+                      - { ElementId: kpi-unassigned, ElementType: VISUAL, RowIndex: 0, ColumnIndex: 18, ColumnSpan: 9, RowSpan: 5 }
+                      - { ElementId: kpi-waiting, ElementType: VISUAL, RowIndex: 0, ColumnIndex: 27, ColumnSpan: 9, RowSpan: 5 }
+                      - { ElementId: kpi-self-service, ElementType: VISUAL, RowIndex: 5, ColumnIndex: 0, ColumnSpan: 9, RowSpan: 5 }
+                      - { ElementId: kpi-conversations, ElementType: VISUAL, RowIndex: 5, ColumnIndex: 9, ColumnSpan: 9, RowSpan: 5 }
+                      - { ElementId: kpi-photo, ElementType: VISUAL, RowIndex: 5, ColumnIndex: 18, ColumnSpan: 9, RowSpan: 5 }
+                      - { ElementId: kpi-safety, ElementType: VISUAL, RowIndex: 5, ColumnIndex: 27, ColumnSpan: 9, RowSpan: 5 }
+                      - { ElementId: chart-status, ElementType: VISUAL, RowIndex: 10, ColumnIndex: 0, ColumnSpan: 12, RowSpan: 9 }
+                      - { ElementId: chart-priority, ElementType: VISUAL, RowIndex: 10, ColumnIndex: 12, ColumnSpan: 12, RowSpan: 9 }
+                      - { ElementId: chart-category, ElementType: VISUAL, RowIndex: 10, ColumnIndex: 24, ColumnSpan: 12, RowSpan: 9 }
+                      - { ElementId: servicecare-ticket-trend, ElementType: VISUAL, RowIndex: 19, ColumnIndex: 0, ColumnSpan: 24, RowSpan: 10 }
+                      - { ElementId: chart-resolution-time, ElementType: VISUAL, RowIndex: 19, ColumnIndex: 24, ColumnSpan: 12, RowSpan: 10 }
+            Visuals:
+              - KPIVisual:
+                  VisualId: kpi-open
+                  Title: { Visibility: VISIBLE, FormatText: { PlainText: Open tickets } }
+                  ChartConfiguration:
+                    FieldWells:
+                      Values:
+                        - NumericalMeasureField:
+                            FieldId: open_tickets
+                            Column: { DataSetIdentifier: Analytics, ColumnName: open_tickets }
+                            AggregationFunction: { SimpleNumericalAggregation: SUM }
+              - KPIVisual:
+                  VisualId: kpi-high-priority
+                  Title: { Visibility: VISIBLE, FormatText: { PlainText: High-priority open } }
+                  ChartConfiguration:
+                    FieldWells:
+                      Values:
+                        - NumericalMeasureField:
+                            FieldId: high_priority_open
+                            Column: { DataSetIdentifier: Analytics, ColumnName: high_priority_open }
+                            AggregationFunction: { SimpleNumericalAggregation: SUM }
+              - KPIVisual:
+                  VisualId: kpi-unassigned
+                  Title: { Visibility: VISIBLE, FormatText: { PlainText: Awaiting assignment } }
+                  ChartConfiguration:
+                    FieldWells:
+                      Values:
+                        - NumericalMeasureField:
+                            FieldId: unassigned_tickets
+                            Column: { DataSetIdentifier: Analytics, ColumnName: unassigned_tickets }
+                            AggregationFunction: { SimpleNumericalAggregation: SUM }
+              - KPIVisual:
+                  VisualId: kpi-waiting
+                  Title: { Visibility: VISIBLE, FormatText: { PlainText: Waiting for customer } }
+                  ChartConfiguration:
+                    FieldWells:
+                      Values:
+                        - NumericalMeasureField:
+                            FieldId: waiting_for_customer
+                            Column: { DataSetIdentifier: Analytics, ColumnName: waiting_for_customer }
+                            AggregationFunction: { SimpleNumericalAggregation: SUM }
+              - KPIVisual:
+                  VisualId: kpi-self-service
+                  Title: { Visibility: VISIBLE, FormatText: { PlainText: Self-service resolution % } }
+                  ChartConfiguration:
+                    FieldWells:
+                      Values:
+                        - NumericalMeasureField:
+                            FieldId: self_service_rate_pct
+                            Column: { DataSetIdentifier: Analytics, ColumnName: self_service_rate_pct }
+                            AggregationFunction: { SimpleNumericalAggregation: SUM }
+              - KPIVisual:
+                  VisualId: kpi-conversations
+                  Title: { Visibility: VISIBLE, FormatText: { PlainText: Assistant conversations } }
+                  ChartConfiguration:
+                    FieldWells:
+                      Values:
+                        - NumericalMeasureField:
+                            FieldId: assistant_conversations
+                            Column: { DataSetIdentifier: Analytics, ColumnName: assistant_conversations }
+                            AggregationFunction: { SimpleNumericalAggregation: SUM }
+              - KPIVisual:
+                  VisualId: kpi-photo
+                  Title: { Visibility: VISIBLE, FormatText: { PlainText: Photo analyses completed } }
+                  ChartConfiguration:
+                    FieldWells:
+                      Values:
+                        - NumericalMeasureField:
+                            FieldId: photo_analyses
+                            Column: { DataSetIdentifier: Analytics, ColumnName: photo_analyses }
+                            AggregationFunction: { SimpleNumericalAggregation: SUM }
+              - KPIVisual:
+                  VisualId: kpi-safety
+                  Title: { Visibility: VISIBLE, FormatText: { PlainText: Safety photo reviews } }
+                  ChartConfiguration:
+                    FieldWells:
+                      Values:
+                        - NumericalMeasureField:
+                            FieldId: safety_photo_reviews
+                            Column: { DataSetIdentifier: Analytics, ColumnName: safety_photo_reviews }
+                            AggregationFunction: { SimpleNumericalAggregation: SUM }
+              - BarChartVisual:
+                  VisualId: chart-status
+                  Title: { Visibility: VISIBLE, FormatText: { PlainText: Tickets by status } }
+                  ChartConfiguration:
+                    Orientation: HORIZONTAL
+                    BarsArrangement: CLUSTERED
+                    FieldWells:
+                      BarChartAggregatedFieldWells:
+                        Category:
+                          - CategoricalDimensionField:
+                              FieldId: status
+                              Column: { DataSetIdentifier: Breakdown, ColumnName: status }
+                        Values:
+                          - NumericalMeasureField:
+                              FieldId: status_count
+                              Column: { DataSetIdentifier: Breakdown, ColumnName: ticket_count }
+                              AggregationFunction: { SimpleNumericalAggregation: SUM }
+              - PieChartVisual:
+                  VisualId: chart-priority
+                  Title: { Visibility: VISIBLE, FormatText: { PlainText: Tickets by priority } }
+                  ChartConfiguration:
+                    DonutOptions:
+                      ArcOptions: { ArcThickness: MEDIUM }
+                    FieldWells:
+                      PieChartAggregatedFieldWells:
+                        Category:
+                          - CategoricalDimensionField:
+                              FieldId: priority
+                              Column: { DataSetIdentifier: Breakdown, ColumnName: priority }
+                        Values:
+                          - NumericalMeasureField:
+                              FieldId: priority_count
+                              Column: { DataSetIdentifier: Breakdown, ColumnName: ticket_count }
+                              AggregationFunction: { SimpleNumericalAggregation: SUM }
+              - BarChartVisual:
+                  VisualId: chart-category
+                  Title: { Visibility: VISIBLE, FormatText: { PlainText: Tickets by category } }
+                  ChartConfiguration:
+                    Orientation: HORIZONTAL
+                    BarsArrangement: CLUSTERED
+                    FieldWells:
+                      BarChartAggregatedFieldWells:
+                        Category:
+                          - CategoricalDimensionField:
+                              FieldId: category
+                              Column: { DataSetIdentifier: Breakdown, ColumnName: category }
+                        Values:
+                          - NumericalMeasureField:
+                              FieldId: category_count
+                              Column: { DataSetIdentifier: Breakdown, ColumnName: ticket_count }
+                              AggregationFunction: { SimpleNumericalAggregation: SUM }
+              - BarChartVisual:
+                  VisualId: chart-resolution-time
+                  Title: { Visibility: VISIBLE, FormatText: { PlainText: Avg hours to resolve by category } }
+                  ChartConfiguration:
+                    Orientation: HORIZONTAL
+                    BarsArrangement: CLUSTERED
+                    FieldWells:
+                      BarChartAggregatedFieldWells:
+                        Category:
+                          - CategoricalDimensionField:
+                              FieldId: resolution_category
+                              Column: { DataSetIdentifier: Resolution, ColumnName: category }
+                        Values:
+                          - NumericalMeasureField:
+                              FieldId: avg_resolution_hours
+                              Column: { DataSetIdentifier: Resolution, ColumnName: avg_resolution_hours }
+                              AggregationFunction: { SimpleNumericalAggregation: AVERAGE }
+              - LineChartVisual:
+                  VisualId: servicecare-ticket-trend
+                  Title: { Visibility: VISIBLE, FormatText: { PlainText: Tickets opened and resolved } }
+                  ChartConfiguration:
+                    Type: LINE
+                    FieldWells:
+                      LineChartAggregatedFieldWells:
+                        Category:
+                          - CategoricalDimensionField:
+                              FieldId: event_date
+                              Column: { DataSetIdentifier: TicketTrends, ColumnName: event_date }
+                        Values:
+                          - NumericalMeasureField:
+                              FieldId: tickets_opened
+                              Column: { DataSetIdentifier: TicketTrends, ColumnName: tickets_opened }
+                              AggregationFunction: { SimpleNumericalAggregation: SUM }
+                          - NumericalMeasureField:
+                              FieldId: tickets_resolved
+                              Column: { DataSetIdentifier: TicketTrends, ColumnName: tickets_resolved }
+                              AggregationFunction: { SimpleNumericalAggregation: SUM }
+
+Outputs:
+  QuickSightDashboardId:
+    Value: !Ref QuickSightDashboard
+  QuickSightDashboardArn:
+    Value: !GetAtt QuickSightDashboard.Arn

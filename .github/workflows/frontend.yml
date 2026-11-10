@@ -1,0 +1,78 @@
+name: Frontend
+
+# Pipeline 1 of 2. Runs only for changes the web app depends on; a docs-only or backend-only change does not start it.
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'frontend/**'
+      - 'packages/contracts/**'
+      - 'package.json'
+      - 'package-lock.json'
+      - 'tsconfig.base.json'
+      - '.github/workflows/frontend.yml'
+      - '!**/*.md'
+  pull_request:
+    paths:
+      - 'frontend/**'
+      - 'packages/contracts/**'
+      - 'package.json'
+      - 'package-lock.json'
+      - 'tsconfig.base.json'
+      - '.github/workflows/frontend.yml'
+      - '!**/*.md'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+defaults:
+  run:
+    shell: bash
+
+# Verification runs on GitHub-hosted runners for pushes and pull requests. Deployment runs only on main, and only when the
+# repository variable AWS_DEPLOY_ENABLED is 'true' (after the stacks and the GitHub OIDC provider exist in your AWS account).
+jobs:
+  verify:
+    name: Typecheck, test and build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+      - run: npm ci
+      - run: npm run typecheck -w @servicecare/web
+      - run: npm run test:frontend
+      - run: npm run test:scripts
+      - run: npm run build -w @servicecare/web
+
+  deploy:
+    name: Deploy to S3 and CloudFront
+    needs: verify
+    if: github.ref == 'refs/heads/main' && github.event_name != 'pull_request' && vars.AWS_DEPLOY_ENABLED == 'true'
+    runs-on: ubuntu-latest
+    permissions:
+      id-token: write
+      contents: read
+    env:
+      AWS_ACCOUNT_ID: ${{ vars.AWS_ACCOUNT_ID }}
+    concurrency:
+      group: frontend-deploy
+      cancel-in-progress: false
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+      - run: npm ci
+
+      # Short-lived credentials from GitHub's OIDC token; the role trusts only this repository's main branch.
+      - name: Assume the deploy role
+        run: node scripts/deploy.mjs ci-login frontend
+
+      # Bucket, distribution and Cognito settings come from the hosting stack, so nothing is copied into GitHub settings.
+      - name: Build, publish and smoke test
+        run: node scripts/deploy.mjs frontend

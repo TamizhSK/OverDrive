@@ -1,0 +1,77 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >-
+  Remote state for the Terraform serverless variant: an encrypted, versioned S3 bucket that holds the state files and a DynamoDB
+  table that Terraform uses as its lock, so only one person applies at a time. Deploy in the region Terraform deploys to (eu-north-1).
+  The names are fixed so infra/environments/backend.hcl can be committed.
+
+Resources:
+  StateBucket:
+    Type: AWS::S3::Bucket
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Properties:
+      BucketName: !Sub 'servicecare-tfstate-${AWS::AccountId}-${AWS::Region}'
+      OwnershipControls:
+        Rules:
+          - ObjectOwnership: BucketOwnerEnforced
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - BucketKeyEnabled: true
+            ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+      VersioningConfiguration:
+        Status: Enabled
+      LifecycleConfiguration:
+        Rules:
+          - Id: expire-old-state-versions
+            Status: Enabled
+            NoncurrentVersionExpiration:
+              NoncurrentDays: 90
+            AbortIncompleteMultipartUpload:
+              DaysAfterInitiation: 1
+
+  StateBucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket: !Ref StateBucket
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: DenyInsecureTransport
+            Effect: Deny
+            Principal: '*'
+            Action: 's3:*'
+            Resource:
+              - !GetAtt StateBucket.Arn
+              - !Sub '${StateBucket.Arn}/*'
+            Condition:
+              Bool:
+                'aws:SecureTransport': 'false'
+
+  # Terraform writes one item per state while an apply or plan runs and deletes it afterwards; a second run is refused until then.
+  LockTable:
+    Type: AWS::DynamoDB::Table
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Properties:
+      TableName: servicecare-terraform-locks
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - { AttributeName: LockID, AttributeType: S }
+      KeySchema:
+        - { AttributeName: LockID, KeyType: HASH }
+      SSESpecification:
+        SSEEnabled: true
+
+Outputs:
+  StateBucket:
+    Description: Value for "bucket" in infra/environments/backend.hcl.
+    Value: !Ref StateBucket
+  LockTable:
+    Description: Value for "dynamodb_table" in infra/environments/backend.hcl.
+    Value: !Ref LockTable

@@ -1,0 +1,27 @@
+{
+  "name": "servicecare",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "workspaces": ["frontend", "backend", "packages/*"],
+  "engines": { "node": ">=22" },
+  "scripts": {
+    "dev": "concurrently -k -n api,web \"npm run dev -w @servicecare/api\" \"npm run dev -w @servicecare/web\"",
+    "build": "npm run build -w @servicecare/api && npm run build -w @servicecare/web",
+    "typecheck": "npm run typecheck --workspaces --if-present",
+    "test": "node --import tsx --test backend/tests/core.test.ts backend/tests/auth.test.ts backend/tests/visual.test.ts backend/tests/events.test.ts frontend/tests/wireframe.test.ts frontend/tests/support.test.ts scripts/deploy/deploy.test.mjs",
+    "test:backend": "node --import tsx --test backend/tests/core.test.ts backend/tests/auth.test.ts backend/tests/visual.test.ts backend/tests/events.test.ts",
+    "test:frontend": "node --import tsx --test frontend/tests/wireframe.test.ts frontend/tests/support.test.ts",
+    "test:scripts": "node --test scripts/deploy/deploy.test.mjs",
+    "deploy:status": "node scripts/deploy.mjs status",
+    "deploy:infra": "node scripts/deploy.mjs infra",
+    "deploy:backend": "node scripts/deploy.mjs backend",
+    "deploy:frontend": "node scripts/deploy.mjs frontend"
+  },
+  "devDependencies": {
+    "@types/node": "^22.0.0",
+    "concurrently": "^9.0.0",
+    "tsx": "^4.20.0",
+    "typescript": "~5.9.3"
+  }
+}

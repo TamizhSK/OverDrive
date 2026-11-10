@@ -1,0 +1,403 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: Isolated visual API, worker, sessions and malware-scanned photos. Deploy beside the tickets table in us-east-1.
+Parameters:
+  EnableVisualSupport:
+    Type: String
+    Default: 'false'
+    AllowedValues: ['true', 'false']
+  ImageUri:
+    Type: String
+    Description: Same-region ECR image built from backend/visual.Dockerfile, pinned by sha256 digest.
+    AllowedPattern: '.+@sha256:[a-f0-9]{64}'
+  WebOrigin:
+    Type: String
+  LocalDevelopmentOrigin:
+    Type: String
+    Default: http://localhost:5173
+  CognitoIssuer:
+    Type: String
+  CognitoClientIds:
+    Type: CommaDelimitedList
+  TicketsTableName:
+    Type: String
+  AttachmentsBucketName:
+    Type: String
+  VisualHarnessArn:
+    Type: String
+  VisualRuntimeArn:
+    Type: String
+  AgentRegion:
+    Type: String
+    Default: eu-north-1
+    AllowedValues: [eu-north-1]
+  KnowledgeBaseId:
+    Type: String
+  GuidanceModelId:
+    Type: String
+    Default: amazon.nova-lite-v1:0
+    AllowedPattern: '(amazon\.nova-lite-v1:0|eu\..+)'
+  VisionModelId:
+    Type: String
+    Default: amazon.nova-lite-v1:0
+    AllowedValues: [amazon.nova-lite-v1:0]
+Conditions:
+  VisualEnabled: !Equals [!Ref EnableVisualSupport, 'true']
+Resources:
+  Sessions:
+    Type: AWS::DynamoDB::Table
+    # checkov:skip=CKV_AWS_119:Dev synthetic data uses encrypted AWS-managed DynamoDB storage; no customer CMK baseline.
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Properties:
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions: [{AttributeName: sessionId, AttributeType: S}]
+      KeySchema: [{AttributeName: sessionId, KeyType: HASH}]
+      SSESpecification: {SSEEnabled: true}
+      PointInTimeRecoverySpecification: {PointInTimeRecoveryEnabled: true}
+      TimeToLiveSpecification: {AttributeName: expiresAt, Enabled: true}
+      StreamSpecification: {StreamViewType: NEW_AND_OLD_IMAGES}
+  Photos:
+    Type: AWS::S3::Bucket
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Properties:
+      OwnershipControls: {Rules: [{ObjectOwnership: BucketOwnerEnforced}]}
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      BucketEncryption:
+        ServerSideEncryptionConfiguration: [{ServerSideEncryptionByDefault: {SSEAlgorithm: AES256}}]
+      VersioningConfiguration: {Status: Enabled}
+      LoggingConfiguration:
+        DestinationBucketName: !Ref PhotoAccessLogs
+        LogFilePrefix: visual/
+      CorsConfiguration:
+        CorsRules:
+          - AllowedOrigins: [!Ref WebOrigin, !Ref LocalDevelopmentOrigin]
+            AllowedMethods: [POST]
+            AllowedHeaders: ['*']
+            MaxAge: 300
+      LifecycleConfiguration:
+        Rules:
+          - Id: QuarantineRetention
+            Status: Enabled
+            ExpirationInDays: 2
+            NoncurrentVersionExpiration: {NoncurrentDays: 2}
+            AbortIncompleteMultipartUpload: {DaysAfterInitiation: 1}
+  PhotoAccessLogs:
+    Type: AWS::S3::Bucket
+    # checkov:skip=CKV_AWS_18:Access-log destination does not recursively log itself.
+    Properties:
+      OwnershipControls: {Rules: [{ObjectOwnership: BucketOwnerEnforced}]}
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      BucketEncryption:
+        ServerSideEncryptionConfiguration: [{ServerSideEncryptionByDefault: {SSEAlgorithm: AES256}}]
+      VersioningConfiguration: {Status: Enabled}
+      LifecycleConfiguration:
+        Rules:
+          - Id: LogRetention
+            Status: Enabled
+            ExpirationInDays: 7
+            NoncurrentVersionExpiration: {NoncurrentDays: 7}
+  PhotoAccessLogsPolicy:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket: !Ref PhotoAccessLogs
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal: {Service: logging.s3.amazonaws.com}
+            Action: s3:PutObject
+            Resource: !Sub '${PhotoAccessLogs.Arn}/visual/*'
+            Condition:
+              ArnLike: {aws:SourceArn: !GetAtt Photos.Arn}
+              StringEquals: {aws:SourceAccount: !Ref AWS::AccountId}
+          - Effect: Deny
+            Principal: '*'
+            Action: s3:*
+            Resource: [!GetAtt PhotoAccessLogs.Arn, !Sub '${PhotoAccessLogs.Arn}/*']
+            Condition: {Bool: {aws:SecureTransport: 'false'}}
+  PhotoPolicy:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket: !Ref Photos
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Deny
+            Principal: '*'
+            Action: s3:*
+            Resource: [!GetAtt Photos.Arn, !Sub '${Photos.Arn}/*']
+            Condition: {Bool: {aws:SecureTransport: 'false'}}
+  ScanRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal: {Service: malware-protection-plan.guardduty.amazonaws.com}
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: ScanOnlyVisualPhotos
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action: [events:PutRule, events:DeleteRule, events:PutTargets, events:RemoveTargets]
+                Resource: !Sub arn:${AWS::Partition}:events:${AWS::Region}:${AWS::AccountId}:rule/DO-NOT-DELETE-AmazonGuardDutyMalwareProtectionS3*
+                Condition:
+                  StringLike: {events:ManagedBy: malware-protection-plan.guardduty.amazonaws.com}
+              - Effect: Allow
+                Action: [events:DescribeRule, events:ListTargetsByRule]
+                Resource: !Sub arn:${AWS::Partition}:events:${AWS::Region}:${AWS::AccountId}:rule/DO-NOT-DELETE-AmazonGuardDutyMalwareProtectionS3*
+              - Effect: Allow
+                Action: [s3:GetObject, s3:GetObjectVersion, s3:GetObjectTagging, s3:GetObjectVersionTagging, s3:PutObjectTagging, s3:PutObjectVersionTagging]
+                Resource: !Sub '${Photos.Arn}/*'
+              - Effect: Allow
+                Action: [s3:ListBucket, s3:GetBucketNotification, s3:PutBucketNotification]
+                Resource: !GetAtt Photos.Arn
+              - Effect: Allow
+                Action: s3:PutObject
+                Resource: !Sub '${Photos.Arn}/malware-protection-resource-validation-object'
+  MalwareProtection:
+    Type: AWS::GuardDuty::MalwareProtectionPlan
+    Properties:
+      Role: !GetAtt ScanRole.Arn
+      ProtectedResource: {S3Bucket: {BucketName: !Ref Photos}}
+      Actions: {Tagging: {Status: ENABLED}}
+  ApiLogs:
+    Type: AWS::Logs::LogGroup
+    # checkov:skip=CKV_AWS_158:Dev logs use default encrypted CloudWatch storage; prompts and images are not logged.
+    Properties: {RetentionInDays: 14}
+  WorkerLogs:
+    Type: AWS::Logs::LogGroup
+    # checkov:skip=CKV_AWS_158:Dev logs use default encrypted CloudWatch storage; prompts and images are not logged.
+    Properties: {RetentionInDays: 14}
+  ApiAccessLogs:
+    Type: AWS::Logs::LogGroup
+    # checkov:skip=CKV_AWS_158:Dev access logs contain request IDs, routes and status only, with default storage encryption.
+    Properties: {RetentionInDays: 14}
+  Failures:
+    Type: AWS::SQS::Queue
+    # checkov:skip=CKV_AWS_27:SqsManagedSseEnabled encrypts this queue; scanner expects the older KMS property.
+    Properties:
+      SqsManagedSseEnabled: true
+      MessageRetentionPeriod: 1209600
+  GuidancePolicy:
+    Type: AWS::IAM::Policy
+    Properties:
+      PolicyName: VisualKnowledgeAndHarness
+      Roles: [!Ref ApiRole, !Ref WorkerRole]
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Action: bedrock:Retrieve
+            Resource: !Sub arn:${AWS::Partition}:bedrock:${AgentRegion}:${AWS::AccountId}:knowledge-base/${KnowledgeBaseId}
+          - Effect: Allow
+            Action: [bedrock-agentcore:InvokeHarness, bedrock-agentcore:InvokeAgentRuntime]
+            Resource: [!Ref VisualHarnessArn, !Ref VisualRuntimeArn, !Sub '${VisualRuntimeArn}/runtime-endpoint/DEFAULT']
+  ApiRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement: [{Effect: Allow, Principal: {Service: lambda.amazonaws.com}, Action: sts:AssumeRole}]
+      Policies:
+        - PolicyName: VisualCustomerSessions
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action: [dynamodb:GetItem, dynamodb:PutItem, dynamodb:Scan]
+                Resource: [!GetAtt Sessions.Arn, !Sub 'arn:${AWS::Partition}:dynamodb:${AWS::Region}:${AWS::AccountId}:table/${TicketsTableName}']
+              - Effect: Allow
+                Action: [s3:PutObject, s3:GetObject, s3:GetObjectVersion, s3:GetObjectTagging, s3:GetObjectVersionTagging]
+                Resource: !Sub '${Photos.Arn}/*'
+              - Effect: Allow
+                Action: [s3:PutObject, s3:PutObjectTagging]
+                Resource: !Sub arn:${AWS::Partition}:s3:::${AttachmentsBucketName}/*
+              - Effect: Allow
+                Action: [logs:CreateLogStream, logs:PutLogEvents]
+                Resource: !Sub '${ApiLogs.Arn}:*'
+  WorkerRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement: [{Effect: Allow, Principal: {Service: lambda.amazonaws.com}, Action: sts:AssumeRole}]
+      Policies:
+        - PolicyName: VisualAnalysisOnly
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action: [dynamodb:GetItem, dynamodb:PutItem]
+                Resource: !GetAtt Sessions.Arn
+              - Effect: Allow
+                Action: [dynamodb:DescribeStream, dynamodb:GetRecords, dynamodb:GetShardIterator, dynamodb:ListStreams]
+                Resource: !GetAtt Sessions.StreamArn
+              - Effect: Allow
+                Action: [s3:GetObjectVersion, s3:GetObjectVersionTagging]
+                Resource: !Sub '${Photos.Arn}/*'
+              - Effect: Allow
+                Action: [rekognition:DetectLabels, rekognition:DetectText]
+                Resource: '*'
+              - Effect: Allow
+                Action: bedrock:InvokeModel
+                Resource: !Sub arn:${AWS::Partition}:bedrock:${AgentRegion}::foundation-model/amazon.nova-lite-v1:0
+              - Effect: Allow
+                Action: sqs:SendMessage
+                Resource: !GetAtt Failures.Arn
+              - Effect: Allow
+                Action: [logs:CreateLogStream, logs:PutLogEvents]
+                Resource: !Sub '${WorkerLogs.Arn}:*'
+  ApiFunction:
+    Type: AWS::Lambda::Function
+    # checkov:skip=CKV_AWS_116:HTTP API invocation is synchronous; errors return to the caller rather than a Lambda async queue.
+    # checkov:skip=CKV_AWS_117:Dev Lambda uses TLS public AWS endpoints; no private database or NAT dependency.
+    # checkov:skip=CKV_AWS_173:Environment has public resource identifiers only and default Lambda encryption.
+    DependsOn: GuidancePolicy
+    Properties:
+      PackageType: Image
+      Code: {ImageUri: !Ref ImageUri}
+      ImageConfig: {Command: [lambda.handler]}
+      Role: !GetAtt ApiRole.Arn
+      MemorySize: 512
+      Timeout: 28
+      ReservedConcurrentExecutions: 5
+      LoggingConfig: {LogGroup: !Ref ApiLogs}
+      Environment:
+        Variables:
+          VISUAL_TABLE: !Ref Sessions
+          VISUAL_BUCKET: !Ref Photos
+          TICKETS_TABLE: !Ref TicketsTableName
+          TICKETS_REGION: !Ref AWS::Region
+          ATTACHMENTS_BUCKET: !Ref AttachmentsBucketName
+          VISUAL_HARNESS_ARN: !Ref VisualHarnessArn
+          KNOWLEDGE_BASE_ID: !Ref KnowledgeBaseId
+          AGENT_REGION: !Ref AgentRegion
+          GUIDANCE_MODEL_ID: !Ref GuidanceModelId
+          VISION_MODEL_ID: !Ref VisionModelId
+          WEB_ORIGINS: !Join [',', [!Ref WebOrigin, !Ref LocalDevelopmentOrigin]]
+  WorkerFunction:
+    Type: AWS::Lambda::Function
+    # checkov:skip=CKV_AWS_116:DynamoDB event-source mapping has an encrypted SQS OnFailure destination.
+    # checkov:skip=CKV_AWS_117:Dev Lambda uses TLS public AWS endpoints; no private database or NAT dependency.
+    # checkov:skip=CKV_AWS_173:Environment has public resource identifiers only and default Lambda encryption.
+    DependsOn: GuidancePolicy
+    Properties:
+      PackageType: Image
+      Code: {ImageUri: !Ref ImageUri}
+      ImageConfig: {Command: [worker.handler]}
+      Role: !GetAtt WorkerRole.Arn
+      MemorySize: 2048
+      Timeout: 120
+      ReservedConcurrentExecutions: 2
+      LoggingConfig: {LogGroup: !Ref WorkerLogs}
+      Environment:
+        Variables:
+          VISUAL_TABLE: !Ref Sessions
+          VISUAL_BUCKET: !Ref Photos
+          TICKETS_TABLE: !Ref TicketsTableName
+          TICKETS_REGION: !Ref AWS::Region
+          ATTACHMENTS_BUCKET: !Ref AttachmentsBucketName
+          VISUAL_HARNESS_ARN: !Ref VisualHarnessArn
+          KNOWLEDGE_BASE_ID: !Ref KnowledgeBaseId
+          AGENT_REGION: !Ref AgentRegion
+          GUIDANCE_MODEL_ID: !Ref GuidanceModelId
+          VISION_MODEL_ID: !Ref VisionModelId
+  AnalysisEvents:
+    Type: AWS::Lambda::EventSourceMapping
+    DependsOn: MalwareProtection
+    Properties:
+      Enabled: !If [VisualEnabled, true, false]
+      EventSourceArn: !GetAtt Sessions.StreamArn
+      FunctionName: !Ref WorkerFunction
+      StartingPosition: LATEST
+      BatchSize: 1
+      MaximumRetryAttempts: 500
+      MaximumRecordAgeInSeconds: 1800
+      FunctionResponseTypes: [ReportBatchItemFailures]
+      DestinationConfig: {OnFailure: {Destination: !GetAtt Failures.Arn}}
+      FilterCriteria:
+        Filters:
+          - Pattern: '{"eventName":["MODIFY"],"dynamodb":{"NewImage":{"phase":{"S":["ANALYSIS_PENDING"]}}}}'
+  HttpApi:
+    Type: AWS::ApiGatewayV2::Api
+    Properties:
+      Name: !Sub '${AWS::StackName}-api'
+      ProtocolType: HTTP
+      CorsConfiguration:
+        AllowOrigins: [!Ref WebOrigin, !Ref LocalDevelopmentOrigin]
+        AllowMethods: [GET, POST, OPTIONS]
+        AllowHeaders: [Content-Type, Authorization]
+  Authorizer:
+    Type: AWS::ApiGatewayV2::Authorizer
+    Properties:
+      ApiId: !Ref HttpApi
+      Name: VisualCognito
+      AuthorizerType: JWT
+      IdentitySource: ['$request.header.Authorization']
+      JwtConfiguration: {Audience: !Ref CognitoClientIds, Issuer: !Ref CognitoIssuer}
+  Integration:
+    Type: AWS::ApiGatewayV2::Integration
+    Properties:
+      ApiId: !Ref HttpApi
+      IntegrationType: AWS_PROXY
+      IntegrationUri: !GetAtt ApiFunction.Arn
+      PayloadFormatVersion: '2.0'
+      TimeoutInMillis: 29000
+  Route:
+    Type: AWS::ApiGatewayV2::Route
+    Condition: VisualEnabled
+    Properties:
+      ApiId: !Ref HttpApi
+      RouteKey: ANY /visual/{proxy+}
+      AuthorizationType: JWT
+      AuthorizerId: !Ref Authorizer
+      Target: !Sub integrations/${Integration}
+  PreflightRoute:
+    Type: AWS::ApiGatewayV2::Route
+    Condition: VisualEnabled
+    Properties:
+      ApiId: !Ref HttpApi
+      RouteKey: OPTIONS /visual/{proxy+}
+      AuthorizationType: NONE
+      Target: !Sub integrations/${Integration}
+  Stage:
+    Type: AWS::ApiGatewayV2::Stage
+    Properties:
+      ApiId: !Ref HttpApi
+      StageName: '$default'
+      AutoDeploy: true
+      AccessLogSettings:
+        DestinationArn: !GetAtt ApiAccessLogs.Arn
+        Format: '{"requestId":"$context.requestId","route":"$context.routeKey","status":"$context.status"}'
+      DefaultRouteSettings: {ThrottlingBurstLimit: 5, ThrottlingRateLimit: 2}
+  InvokePermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref ApiFunction
+      Action: lambda:InvokeFunction
+      Principal: apigateway.amazonaws.com
+      SourceArn: !Sub arn:${AWS::Partition}:execute-api:${AWS::Region}:${AWS::AccountId}:${HttpApi}/*/*/visual/*
+Outputs:
+  VisualApiUrl:
+    Value: !GetAtt HttpApi.ApiEndpoint
+  SessionsTableName:
+    Value: !Ref Sessions
+  SessionsStreamArn:
+    Value: !GetAtt Sessions.StreamArn
+  QuarantineBucket:
+    Value: !Ref Photos
+  FailureQueueUrl:
+    Value: !Ref Failures

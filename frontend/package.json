@@ -1,0 +1,28 @@
+{
+  "name": "@servicecare/web",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "dev": "vite --host 127.0.0.1",
+    "build": "tsc -p tsconfig.json && vite build",
+    "typecheck": "tsc -p tsconfig.json"
+  },
+  "dependencies": {
+    "@servicecare/contracts": "*",
+    "amazon-cognito-identity-js": "^6.3.22",
+    "aws-amplify": "^6.22.2",
+    "buffer": "^4.9.2",
+    "lucide-react": "^0.468.0",
+    "oidc-client-ts": "^3.5.0",
+    "react": "^19.2.0",
+    "react-dom": "^19.2.0",
+    "react-router-dom": "^7.9.0"
+  },
+  "devDependencies": {
+    "@types/react": "^19.2.0",
+    "@types/react-dom": "^19.2.0",
+    "@vitejs/plugin-react": "^5.0.0",
+    "vite": "^7.1.0"
+  }
+}

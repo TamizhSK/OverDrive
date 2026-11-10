@@ -1,0 +1,18 @@
+node_modules/
+dist/
+.env
+.env.*
+!.env.example
+.terraform/
+*.tfstate
+*.tfstate.*
+*.tfplan
+*.tfvars
+!*.tfvars.example
+terraform.rc
+crash.log
+coverage/
+test-results/
+.DS_Store
+# IDE project files
+.idea/

@@ -1,0 +1,5 @@
+# Files that execute on Linux (CI runners, containers) keep LF endings even when checked out on Windows.
+Dockerfile*                  text eol=lf
+*.dockerignore               text eol=lf
+.github/workflows/*.yml      text eol=lf
+infra/cloudformation/*.yml   text eol=lf

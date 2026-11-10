@@ -1,0 +1,14 @@
+.visual-support { width: 100%; max-width: 700px; margin: 0 auto; padding: 20px 0; }
+.visual-support h2 { font-size: 22px; margin: 0 0 18px; }
+.visual-support h3 { font-size: 16px; margin: 18px 0 10px; }
+.visual-support p, .visual-support li { font-size: 14px; line-height: 1.6; overflow-wrap: anywhere; }
+.visual-support p, .visual-support details { margin: 12px 0; }
+.visual-support ul { padding-left: 22px; margin: 12px 0; }
+.visual-support label { display: block; font-size: 13px; margin: 15px 0; }
+.visual-support input, .visual-support textarea { width: 100%; min-width: 0; margin-top: 8px; }
+.visual-support textarea { min-height: 110px; }
+.visual-support output { display: flex; align-items: center; gap: 10px; padding: 15px 0; }
+.visual-support .visual-actions { display: flex; flex-wrap: wrap; gap: 10px; margin: 18px 0; }
+.visual-support .button { min-height: 44px; white-space: normal; text-align: left; }
+.visual-support form { padding-top: 15px; border-top: 1px solid #dedede; }
+@media (max-width: 600px) { .visual-support { padding: 12px 0; } .visual-support h2 { font-size: 20px; } }

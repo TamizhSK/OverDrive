@@ -1,0 +1,319 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >-
+  ServiceCare frontend hosting. CloudFront in front of the EXISTING private S3 bucket (Origin Access Control, SPA routing,
+  optional /api/* route to the backend HTTP API), a Cognito app client on the EXISTING user pool, and the GitHub Actions
+  deploy role. Deploy in the region of the bucket (eu-north-1).
+
+Parameters:
+  ExistingBucketName:
+    Type: String
+    Default: servicecare-frontend-bucket
+    AllowedPattern: '^[a-z0-9][a-z0-9.-]{1,61}[a-z0-9]$'
+    Description: Existing private bucket in this stack's region. This stack REPLACES its bucket policy (see LegacyDistributionId).
+  LegacyDistributionId:
+    Type: String
+    Default: ''
+    AllowedPattern: '^(E[A-Z0-9]{8,20})?$'
+    Description: Older distribution that keeps read access to the bucket so its site does not go dark. Set to an empty value to retire it.
+  LegacyOrigin:
+    Type: String
+    Default: ''
+    AllowedPattern: '^(https://[^/]+)?$'
+    Description: HTTPS origin of that older distribution. Because both share the bucket, it serves this build too, so sign-in is allowed from it as well. Empty removes it.
+  UserPoolId:
+    Type: String
+    AllowedPattern: '^[a-z]{2}-[a-z]+-[0-9]_[A-Za-z0-9]+$'
+    Description: Existing Cognito user pool (same region as this stack). A new app client is added; nothing else in the pool changes.
+  UserPoolDomainPrefix:
+    Type: String
+    AllowedPattern: '^[a-z0-9][a-z0-9-]*$'
+    Description: Prefix of the pool's existing hosted-UI domain.
+  LocalDevOrigin:
+    Type: String
+    Default: 'http://localhost:5173'
+    AllowedPattern: '^(https?://[^/]+)?$'
+    Description: Extra origin allowed for local sign-in against this pool. Empty disables it.
+  ApiOriginDomainName:
+    Type: String
+    Default: ''
+    AllowedPattern: '^([A-Za-z0-9.-]+)?$'
+    Description: Domain of the backend HTTP API (backend stack output ApiGatewayDomainName). Empty means no /api/* route yet (deploy the backend stack, then set this).
+  OriginVerifyToken:
+    Type: String
+    Default: ''
+    NoEcho: true
+    AllowedPattern: '^([A-Za-z0-9]{32,128})?$'
+    Description: Shared secret CloudFront sends to the backend API as X-Origin-Verify. Must equal the backend stack's OriginVerifyToken.
+  WebAclArn:
+    Type: String
+    Default: ''
+    AllowedPattern: '^(arn:aws:wafv2:us-east-1:[0-9]{12}:global/webacl/.+)?$'
+    Description: Optional WAFv2 web ACL (CLOUDFRONT scope, us-east-1) to attach to the distribution.
+  PriceClass:
+    Type: String
+    Default: PriceClass_100
+    AllowedValues: [PriceClass_100, PriceClass_200, PriceClass_All]
+  GitHubRepository:
+    Type: String
+    Default: your-org/overdrive
+    AllowedPattern: '^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$'
+    Description: OWNER/REPOSITORY allowed to assume the deploy role.
+  GitHubBranch:
+    Type: String
+    Default: main
+    AllowedPattern: '^[A-Za-z0-9._/-]+$'
+    Description: Only workflows running on this branch can assume the deploy role.
+  PermissionsBoundaryArn:
+    Type: String
+    Default: ''
+    Description: Optional IAM permissions boundary for the deploy role.
+
+Rules:
+  ApiRouteNeedsToken:
+    RuleCondition: !Not [!Equals [!Ref ApiOriginDomainName, '']]
+    Assertions:
+      - Assert: !Not [!Equals [!Ref OriginVerifyToken, '']]
+        AssertDescription: OriginVerifyToken is required when ApiOriginDomainName is set.
+
+Conditions:
+  HasLegacyDistribution: !Not [!Equals [!Ref LegacyDistributionId, '']]
+  HasLegacyOrigin: !Not [!Equals [!Ref LegacyOrigin, '']]
+  HasLocalDevOrigin: !Not [!Equals [!Ref LocalDevOrigin, '']]
+  HasApiOrigin: !Not [!Equals [!Ref ApiOriginDomainName, '']]
+  HasWebAcl: !Not [!Equals [!Ref WebAclArn, '']]
+  HasPermissionsBoundary: !Not [!Equals [!Ref PermissionsBoundaryArn, '']]
+
+Resources:
+  # Client-side routes (no file extension) are answered with index.html. A function is used instead of distribution-wide
+  # custom error pages because those would also rewrite 403/404 responses coming from the API.
+  SpaRewriteFunction:
+    Type: AWS::CloudFront::Function
+    Properties:
+      Name: !Sub '${AWS::StackName}-spa-rewrite'
+      AutoPublish: true
+      FunctionConfig:
+        Comment: Serve index.html for client-side routes
+        Runtime: cloudfront-js-2.0
+      FunctionCode: |
+        function handler(event) {
+          var request = event.request;
+          var last = request.uri.substring(request.uri.lastIndexOf('/') + 1);
+          if (last.indexOf('.') === -1) {
+            request.uri = '/index.html';
+          }
+          return request;
+        }
+
+  SecurityHeaders:
+    Type: AWS::CloudFront::ResponseHeadersPolicy
+    Properties:
+      ResponseHeadersPolicyConfig:
+        Name: !Sub '${AWS::StackName}-security'
+        SecurityHeadersConfig:
+          ContentTypeOptions:
+            Override: true
+          FrameOptions:
+            FrameOption: DENY
+            Override: true
+          ReferrerPolicy:
+            ReferrerPolicy: strict-origin-when-cross-origin
+            Override: true
+          StrictTransportSecurity:
+            AccessControlMaxAgeSec: 31536000
+            IncludeSubdomains: true
+            Override: true
+
+  OriginAccessControl:
+    Type: AWS::CloudFront::OriginAccessControl
+    Properties:
+      OriginAccessControlConfig:
+        Name: !Sub '${AWS::StackName}-s3'
+        OriginAccessControlOriginType: s3
+        SigningBehavior: always
+        SigningProtocol: sigv4
+
+  WebDistribution:
+    Type: AWS::CloudFront::Distribution
+    Properties:
+      DistributionConfig:
+        Enabled: true
+        Comment: !Sub '${AWS::StackName}: React app (S3) and /api/* (backend)'
+        DefaultRootObject: index.html
+        HttpVersion: http2and3
+        IPV6Enabled: true
+        PriceClass: !Ref PriceClass
+        WebACLId: !If [HasWebAcl, !Ref WebAclArn, !Ref 'AWS::NoValue']
+        Origins:
+          - Id: web
+            DomainName: !Sub '${ExistingBucketName}.s3.${AWS::Region}.amazonaws.com'
+            OriginAccessControlId: !GetAtt OriginAccessControl.Id
+            S3OriginConfig:
+              OriginAccessIdentity: ''
+          - !If
+            - HasApiOrigin
+            - Id: api
+              DomainName: !Ref ApiOriginDomainName
+              OriginCustomHeaders:
+                - HeaderName: X-Origin-Verify
+                  HeaderValue: !Ref OriginVerifyToken
+              CustomOriginConfig:
+                OriginProtocolPolicy: http-only
+                HTTPPort: 80
+                OriginReadTimeout: 30
+                OriginKeepaliveTimeout: 5
+            - !Ref 'AWS::NoValue'
+        DefaultCacheBehavior:
+          TargetOriginId: web
+          ViewerProtocolPolicy: redirect-to-https
+          AllowedMethods: [GET, HEAD, OPTIONS]
+          CachedMethods: [GET, HEAD]
+          Compress: true
+          CachePolicyId: 658327ea-f89d-4fab-a63d-7e88639e58f6 # Managed-CachingOptimized
+          ResponseHeadersPolicyId: !Ref SecurityHeaders
+          FunctionAssociations:
+            - EventType: viewer-request
+              FunctionARN: !GetAtt SpaRewriteFunction.FunctionMetadata.FunctionARN
+        CacheBehaviors: !If
+          - HasApiOrigin
+          - - PathPattern: /api/*
+              TargetOriginId: api
+              ViewerProtocolPolicy: https-only
+              AllowedMethods: [GET, HEAD, OPTIONS, PUT, POST, PATCH, DELETE]
+              CachedMethods: [GET, HEAD]
+              Compress: true
+              CachePolicyId: 4135ea2d-6df8-44a3-9df3-4b5a84be39ad # Managed-CachingDisabled
+              OriginRequestPolicyId: b689b0a8-53d0-40ab-baf2-68738e2966ac # Managed-AllViewerExceptHostHeader
+          - !Ref 'AWS::NoValue'
+
+  # Replaces the bucket's current policy: CloudFront (this distribution and, optionally, the legacy one) may read objects.
+  BucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Properties:
+      Bucket: !Ref ExistingBucketName
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: DenyInsecureTransport
+            Effect: Deny
+            Principal: '*'
+            Action: 's3:*'
+            Resource:
+              - !Sub 'arn:${AWS::Partition}:s3:::${ExistingBucketName}'
+              - !Sub 'arn:${AWS::Partition}:s3:::${ExistingBucketName}/*'
+            Condition:
+              Bool:
+                'aws:SecureTransport': 'false'
+          - Sid: AllowCloudFrontRead
+            Effect: Allow
+            Principal:
+              Service: cloudfront.amazonaws.com
+            Action: 's3:GetObject'
+            Resource: !Sub 'arn:${AWS::Partition}:s3:::${ExistingBucketName}/*'
+            Condition:
+              StringEquals:
+                'AWS:SourceArn':
+                  - !Sub 'arn:${AWS::Partition}:cloudfront::${AWS::AccountId}:distribution/${WebDistribution}'
+                  - !If
+                    - HasLegacyDistribution
+                    - !Sub 'arn:${AWS::Partition}:cloudfront::${AWS::AccountId}:distribution/${LegacyDistributionId}'
+                    - !Ref 'AWS::NoValue'
+
+  WebUserPoolClient:
+    Type: AWS::Cognito::UserPoolClient
+    Properties:
+      UserPoolId: !Ref UserPoolId
+      ClientName: !Sub '${AWS::StackName}-web'
+      GenerateSecret: false
+      AllowedOAuthFlowsUserPoolClient: true
+      AllowedOAuthFlows: [code]
+      AllowedOAuthScopes: [openid, email, profile]
+      SupportedIdentityProviders: [COGNITO]
+      ExplicitAuthFlows: [ALLOW_REFRESH_TOKEN_AUTH, ALLOW_USER_AUTH, ALLOW_USER_SRP_AUTH]
+      PreventUserExistenceErrors: ENABLED
+      EnableTokenRevocation: true
+      AccessTokenValidity: 60
+      IdTokenValidity: 60
+      RefreshTokenValidity: 5
+      TokenValidityUnits:
+        AccessToken: minutes
+        IdToken: minutes
+        RefreshToken: days
+      CallbackURLs:
+        - !Sub 'https://${WebDistribution.DomainName}/auth/callback'
+        - !If [HasLocalDevOrigin, !Sub '${LocalDevOrigin}/auth/callback', !Ref 'AWS::NoValue']
+        - !If [HasLegacyOrigin, !Sub '${LegacyOrigin}/auth/callback', !Ref 'AWS::NoValue']
+      LogoutURLs:
+        - !Sub 'https://${WebDistribution.DomainName}/login'
+        - !Sub 'https://${WebDistribution.DomainName}/'
+        - !If [HasLocalDevOrigin, !Sub '${LocalDevOrigin}/login', !Ref 'AWS::NoValue']
+        - !If [HasLegacyOrigin, !Sub '${LegacyOrigin}/login', !Ref 'AWS::NoValue']
+
+  WebManagedLoginBranding:
+    Type: AWS::Cognito::ManagedLoginBranding
+    Properties:
+      UserPoolId: !Ref UserPoolId
+      ClientId: !Ref WebUserPoolClient
+      UseCognitoProvidedValues: true
+
+  DeployRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub '${AWS::StackName}-deploy'
+      Description: Frontend deployment from GitHub Actions through OIDC; usable only from the configured repository and branch.
+      MaxSessionDuration: 3600
+      PermissionsBoundary: !If [HasPermissionsBoundary, !Ref PermissionsBoundaryArn, !Ref 'AWS::NoValue']
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Federated: !Sub 'arn:${AWS::Partition}:iam::${AWS::AccountId}:oidc-provider/token.actions.githubusercontent.com'
+            Action: sts:AssumeRoleWithWebIdentity
+            Condition:
+              StringEquals:
+                'token.actions.githubusercontent.com:aud': sts.amazonaws.com
+                'token.actions.githubusercontent.com:sub': !Sub 'repo:${GitHubRepository}:ref:refs/heads/${GitHubBranch}'
+      Policies:
+        - PolicyName: deploy-frontend
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Sid: ListSiteBucket
+                Effect: Allow
+                Action: ['s3:ListBucket', 's3:GetBucketLocation']
+                Resource: !Sub 'arn:${AWS::Partition}:s3:::${ExistingBucketName}'
+              - Sid: WriteSiteObjects
+                Effect: Allow
+                Action: ['s3:PutObject', 's3:DeleteObject']
+                Resource: !Sub 'arn:${AWS::Partition}:s3:::${ExistingBucketName}/*'
+              - Sid: InvalidateThisDistribution
+                Effect: Allow
+                Action: ['cloudfront:CreateInvalidation', 'cloudfront:GetInvalidation']
+                Resource: !Sub 'arn:${AWS::Partition}:cloudfront::${AWS::AccountId}:distribution/${WebDistribution}'
+              # Requests by stack name are authorized against stack/NAME/*, which the exact stack ID would never match.
+              - Sid: ReadThisStacksOutputs
+                Effect: Allow
+                Action: 'cloudformation:DescribeStacks'
+                Resource: !Sub 'arn:${AWS::Partition}:cloudformation:${AWS::Region}:${AWS::AccountId}:stack/${AWS::StackName}/*'
+
+Outputs:
+  WebUrl:
+    Description: Public HTTPS address of the application.
+    Value: !Sub 'https://${WebDistribution.DomainName}'
+  DistributionId:
+    Value: !Ref WebDistribution
+  BucketName:
+    Value: !Ref ExistingBucketName
+  DeployRoleArn:
+    Value: !GetAtt DeployRole.Arn
+  CognitoClientId:
+    Description: Value of VITE_COGNITO_CLIENT_ID; also add it to the backend stack's CognitoClientIds.
+    Value: !Ref WebUserPoolClient
+  CognitoAuthority:
+    Description: Value of VITE_COGNITO_AUTHORITY.
+    Value: !Sub 'https://cognito-idp.${AWS::Region}.amazonaws.com/${UserPoolId}'
+  CognitoDomain:
+    Description: Value of VITE_COGNITO_DOMAIN.
+    Value: !Sub 'https://${UserPoolDomainPrefix}.auth.${AWS::Region}.amazoncognito.com'
